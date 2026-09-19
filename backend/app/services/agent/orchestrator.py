@@ -31,6 +31,7 @@ from app.services.agent.intent_gate import intent_gate
 from app.services.agent.resource_scheduler import ResourceScheduler, ResourceContext
 from app.services.llm.bailian_client import bailian_client
 from app.services.llm.router import ModelRouter
+from app.prompts.registry import prompt_registry
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -47,80 +48,9 @@ class OrchestratorAgent:
 
     MAX_CONCURRENCY = 3  # sub-agent 并发上限（硬约束）
 
-    PLAN_SYSTEM_PROMPT = """你是一个教育垂类AI中台的【任务规划器 Orchestrator】。
-你的核心任务是分析用户的复合教学需求，将其分解为原子任务，并输出 JSON DAG。
+    PLAN_SYSTEM_PROMPT = prompt_registry.render("orchestrator.plan")
 
-可用 sub-agent 列表：
-- lesson_plan: 教案、导学案、教学设计
-- academic_rag: 学术论文研读、文献综述
-- exam_quiz: 命题出题、组卷、试题详解
-- socratic: 启发式辅导答疑
-- math_solver: 数理公式推导、计算
-- curriculum: 课标素养对标审查
-- rubric: 作文/主观题批改
-- slide_outline: 课件PPT大纲
-- code_grader: 代码批改与沙箱评测
-
-输出严格的 JSON（不要包含 markdown 代码块标记），格式如下：
-{
-  "plan": [
-    {
-      "task_id": "T1",
-      "agent": "lesson_plan",
-      "input_summary": "为《导数的几何意义》设计45分钟教案",
-      "depends_on": [],
-      "map_count": 1,
-      "resources": {"file_id": "doc-001", "mode": "read", "section_range": null}
-    },
-    {
-      "task_id": "T2",
-      "agent": "exam_quiz",
-      "input_summary": "基于T1的教案，命制3道不同难度的导数压轴题",
-      "depends_on": ["T1"],
-      "map_count": 3
-    }
-  ],
-  "schedule": "serial",
-  "aggregation_strategy": "concat_with_citations"
-}
-
-resources 字段说明（任务操作文件时声明，否则省略）：
-- file_id: 目标文件 ID
-- mode: read（读取/检索）或 write（修改并生成新版本）
-- section_range: [起始偏移, 结束偏移]，仅操作文件局部章节时给出；null=整个文件
-调度器据此分配读写锁、pin 版本快照；写冲突时自动 rebase。
-
-schedule 字段说明：
-- serial: 任务有依赖链，按拓扑顺序串行
-- parallel: 任务无依赖，可同层并行
-- map_reduce: 同一任务并行跑 map_count 次，投票聚合
-
-aggregation_strategy 字段说明：
-- concat_with_citations: 合并所有 sub-agent 输出，带引用标注
-- best_confidence: 取 confidence 最高的结果
-- vote_dedup: 投票去重（相似内容合并）
-
-注意：
-- map_count > 1 时自动用 map_reduce 模式
-- depends_on 引用前置 task_id，表示依赖关系
-- input_summary 中可引用前置 task 的输出（如"基于T1"）
-- 简单单一任务也输出单节点 plan
-"""
-
-    REFLECT_SYSTEM_PROMPT = """你是教育AI中台的质量评审官。
-请评审以下 sub-agent 的执行结果，判断：
-1. 是否完整回答了用户原始需求？
-2. 内容质量是否达标（教学合规性、LaTeX 语法、逻辑严密性）？
-3. 是否需要补充执行额外的 sub-agent？
-
-输出严格 JSON：
-{
-  "quality_score": 0.85,
-  "issues": ["问题描述"],
-  "needs_retry": false,
-  "retry_tasks": []
-}
-"""
+    REFLECT_SYSTEM_PROMPT = prompt_registry.render("orchestrator.reflect")
 
     def __init__(self):
         self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENCY)

@@ -20,18 +20,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.core.config import settings
 from app.core.redis_client import redis_manager
 from app.services.rag.chunker import estimate_tokens
+from app.prompts.registry import prompt_registry
 
 logger = logging.getLogger(__name__)
 
 # 单条消息在 L1 裁剪后保留的最大字符（首尾各一半）
 L1_MSG_KEEP_CHARS = 600
 
-SUMMARY_SYSTEM_PROMPT = """你是上下文压缩器。把以下中间对话压缩为结构化要点：
-1. 保留：关键事实与数据、已做出的决策、待办事项、约束条件；
-2. 数学公式（$...$ / $$...$$）与数字必须原样保留，不得改写；
-3. 不要添加原文没有的信息。
-严格输出 JSON：
-{"facts": ["..."], "decisions": ["..."], "open_items": ["..."], "narrative": "一段话概述"}"""
+SUMMARY_SYSTEM_PROMPT = prompt_registry.render("context_compressor.summary")
 
 
 def count_messages_tokens(messages: List[Dict[str, str]]) -> int:

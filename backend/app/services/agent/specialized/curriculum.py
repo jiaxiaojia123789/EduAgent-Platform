@@ -4,6 +4,8 @@ from app.services.agent.state import AgentState
 from app.services.agent.sub_agent import SubAgent, SubAgentRegistry
 from app.services.llm.bailian_client import bailian_client
 from app.services.llm.router import ModelRouter
+from app.prompts.registry import prompt_registry
+from app.services.llm.prompt_router import prompt_router
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +19,7 @@ class CurriculumAlignerAgent(SubAgent):
 
     agent_name = "curriculum"
 
-    SYSTEM_PROMPT = """你是一名教育部基础教育课程教材发展中心教研督导专家。
-你的任务是对提交的教案或试卷进行新课标核心素养达成度审查：
-1. 评估学科核心素养的渗透维度与深度（达标、部分达标、未达标）；
-2. 检查活动设计是否体现“学生为主体、探究为本”的课改精神；
-3. 输出具体的修改建议清单与素养雷达评分。"""
+    SYSTEM_PROMPT = prompt_registry.render("curriculum.system")
 
     @classmethod
     async def execute(cls, state: AgentState) -> Dict[str, Any]:
@@ -29,7 +27,8 @@ class CurriculumAlignerAgent(SubAgent):
         model = ModelRouter.route_model("curriculum", len(user_prompt))
 
         messages = [
-            {"role": "system", "content": cls.SYSTEM_PROMPT},
+            {"role": "system", "content": prompt_router.build_system(
+                "curriculum.system", user_prompt, user_id=state.get("user_id"))},
             {"role": "user", "content": f"请针对以下内容进行新课标素养合规与达标度审查：\n{user_prompt}"}
         ]
 

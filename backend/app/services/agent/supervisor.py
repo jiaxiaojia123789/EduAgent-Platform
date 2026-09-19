@@ -3,6 +3,7 @@ from typing import Dict, Any
 from app.services.agent.state import AgentState
 from app.services.llm.bailian_client import bailian_client
 from app.services.llm.router import ModelRouter
+from app.prompts.registry import prompt_registry
 
 logger = logging.getLogger(__name__)
 
@@ -15,19 +16,7 @@ class SupervisorAgent:
     3. Routes to 8 specialized domain agents
     """
 
-    SYSTEM_PROMPT = """你是一个教育垂类AI中台的【Supervisor主控智能体】。
-你的核心任务是分析教师或学生的用户需求，准确判断其意图，并将任务分派给最匹配的专业智能体：
-1. lesson_plan: 教学方案、导学案、教学重难点、课堂环节设计
-2. academic_rag: 学术期刊论文研读、文献综述、课改课题论证
-3. exam_quiz: 命题出题、历年真题模拟、难度梯度组卷、试题详解
-4. socratic: 启发式辅导答疑、循循善诱、不直接给答案、思维破冰
-5. math_solver: 复杂数理公式推导、微积分/几何严格分步计算
-6. curriculum: 新课标核心素养对标审查、教学评价达标检验
-7. rubric: 作文与主观题批改、采分点打分与升格指导
-8. slide_outline: 课件PPT结构大纲、演讲提纲制作
-9. code_grader: 代码自动批改与运行沙箱、算法复杂度诊断、测试用例评测、代码Bug修复与重构指导
-
-请严格分析并输出意图标签。"""
+    SYSTEM_PROMPT = prompt_registry.render("supervisor.system")
 
     @classmethod
     async def route(cls, state: AgentState) -> Dict[str, Any]:

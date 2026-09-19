@@ -4,6 +4,8 @@ from app.services.agent.state import AgentState
 from app.services.agent.sub_agent import SubAgent, SubAgentRegistry
 from app.services.llm.bailian_client import bailian_client
 from app.services.llm.router import ModelRouter
+from app.prompts.registry import prompt_registry
+from app.services.llm.prompt_router import prompt_router
 
 logger = logging.getLogger(__name__)
 
@@ -19,11 +21,7 @@ class SlideOutlineMasterAgent(SubAgent):
 
     agent_name = "slide_outline"
 
-    SYSTEM_PROMPT = """你是一名教学课件设计与PPT架构专家。
-将教学方案提炼为结构清晰、重点突出的演示文稿大纲（PPT Outline）：
-1. 规划幻灯片页数（通常 10-15 页/节课）；
-2. 每一页注明【页面标题】、【核心要点】、【视觉图表/公式建议】与【教师讲授口令】；
-3. 输出标准化 Markdown 格式，便于直通导出 PPTX。"""
+    SYSTEM_PROMPT = prompt_registry.render("slide_outline.system")
 
     @classmethod
     async def execute(cls, state: AgentState) -> Dict[str, Any]:
@@ -31,7 +29,8 @@ class SlideOutlineMasterAgent(SubAgent):
         model = ModelRouter.route_model("slide_outline", len(user_prompt))
 
         messages = [
-            {"role": "system", "content": cls.SYSTEM_PROMPT},
+            {"role": "system", "content": prompt_router.build_system(
+                "slide_outline.system", user_prompt, user_id=state.get("user_id"))},
             {"role": "user", "content": f"请为以下内容生成PPT课件大纲：\n{user_prompt}"}
         ]
 

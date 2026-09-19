@@ -6,6 +6,7 @@ from app.services.agent.state import AgentState
 from app.services.agent.sub_agent import SubAgent, SubAgentRegistry
 from app.services.llm.bailian_client import bailian_client
 from app.services.llm.router import ModelRouter
+from app.prompts.registry import prompt_registry
 from app.services.sandbox.code_executor import code_sandbox
 from app.harness.fingerprint import get_fingerprint_guard
 from app.harness.timeout import run_sync_with_timeout
@@ -68,18 +69,7 @@ class CodeGraderMasterAgent(SubAgent):
         }
     ]
 
-    SYSTEM_PROMPT = """你是一名资深计算机科学教授与信息学奥赛(NOI/ACM)主考官。
-请对学生提交的代码进行全自动深度批改与严谨评测。
-工作机制：
-1. 分析题目要求与学生代码逻辑；
-2. 构造覆盖标准用例、边界边界极限用例、空用例的测试集合；
-3. 调用工具【execute_code_in_sandbox】在安全沙箱中真机运行；
-4. 结合沙箱评测结果，输出包含：
-   - 【批改总评与综合打分】(百分制打分及各维度量规)
-   - 【沙箱测试用例运行明细表】(序号、输入、期望、实际、通过状态、耗时)
-   - 【时空复杂度诊断】(时间复杂度 $O(\\cdot)$ 与空间复杂度 $O(\\cdot)$)
-   - 【代码缺陷与易错边界剖析】(精准定位 Bug 与未考虑的边界)
-   - 【特级导师规范重构方案】(附带类型提示与异常防护的高质量参考代码)"""
+    SYSTEM_PROMPT = prompt_registry.render("code_grader.system")
 
     @classmethod
     async def execute(cls, state: AgentState) -> Dict[str, Any]:

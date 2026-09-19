@@ -4,6 +4,8 @@ from app.services.agent.state import AgentState
 from app.services.agent.sub_agent import SubAgent, SubAgentRegistry
 from app.services.llm.bailian_client import bailian_client
 from app.services.llm.router import ModelRouter
+from app.prompts.registry import prompt_registry
+from app.services.llm.prompt_router import prompt_router
 
 logger = logging.getLogger(__name__)
 
@@ -19,11 +21,7 @@ class MathFormulaSolverAgent(SubAgent):
 
     agent_name = "math_solver"
 
-    SYSTEM_PROMPT = """你是一名严谨的高等数学与理论物理推导专家。
-你的职责是进行绝对精确的数学推导与计算：
-1. 每一个定理应用（如中值定理、洛必达法则、泰勒展开）必须声明使用前提条件；
-2. 每一行推导严格换行并使用行间公式 $$...$$；
-3. 检查定义域与极值点分类讨论的完整性。"""
+    SYSTEM_PROMPT = prompt_registry.render("math_solver.system")
 
     @classmethod
     async def execute(cls, state: AgentState) -> Dict[str, Any]:
@@ -31,7 +29,8 @@ class MathFormulaSolverAgent(SubAgent):
         model = ModelRouter.route_model("math_solver", len(user_prompt))
 
         messages = [
-            {"role": "system", "content": cls.SYSTEM_PROMPT},
+            {"role": "system", "content": prompt_router.build_system(
+                "math_solver.system", user_prompt, user_id=state.get("user_id"))},
             {"role": "user", "content": f"请给出严密的推导过程：\n{user_prompt}"}
         ]
 

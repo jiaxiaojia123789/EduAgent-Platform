@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from app.services.llm.bailian_client import bailian_client
 from app.services.llm.router import ModelRouter
+from app.prompts.registry import prompt_registry
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -26,27 +27,7 @@ VALID_AGENTS = [
     "math_solver", "curriculum", "rubric", "slide_outline", "code_grader",
 ]
 
-GATE_SYSTEM_PROMPT = """你是教育AI中台的意图门控器。请用一次快速判定给用户请求分流。
-
-可用智能体：
-lesson_plan(教案), academic_rag(文献研读), exam_quiz(命题组卷), socratic(启发答疑),
-math_solver(数理推导), curriculum(课标对标), rubric(主观题批改),
-slide_outline(课件大纲), code_grader(代码批改)
-
-判定规则：
-- trivial：只需要一个智能体即可完成的单一意图请求（如"出5道选择题"、"解释这个公式"）
-- compound：包含两个及以上可独立拆分的意图，或明确跨环节/要求协作
-  （如"分析这份文档并出配套试卷再写教案"）
-
-严格输出 JSON（不要 markdown 代码块）：
-{
-  "complexity": "trivial",
-  "agent": "exam_quiz",
-  "candidates": ["exam_quiz"],
-  "reason": "单一命题意图"
-}
-agent：trivial 时填唯一目标智能体；compound 时填空字符串。
-candidates：按匹配度排序的相关智能体列表。"""
+GATE_SYSTEM_PROMPT = prompt_registry.render("intent_gate.system")
 
 
 @dataclass

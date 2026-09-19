@@ -4,6 +4,8 @@ from app.services.agent.state import AgentState
 from app.services.agent.sub_agent import SubAgent, SubAgentRegistry
 from app.services.llm.bailian_client import bailian_client
 from app.services.llm.router import ModelRouter
+from app.prompts.registry import prompt_registry
+from app.services.llm.prompt_router import prompt_router
 from app.services.rag.hybrid_search import hybrid_search_engine
 from app.services.rag.reranker import bge_reranker
 from app.services.rag.hallucination import hallucination_checker
@@ -23,12 +25,7 @@ class AcademicRAGAgent(SubAgent):
 
     agent_name = "academic_rag"
 
-    SYSTEM_PROMPT = """你是一个教育学术文献研读专家。你的职责是基于检索到的文献切片回答学术研读问题。
-必须遵守以下学术规范：
-1. 答案必须严格基于给出的参考资料，并在关键论点后标注引用标号，如 [1], [2]；
-2. 严禁凭空捏造论文结论或数据；
-3. 对涉及的公式保持标准 LaTeX 格式；
-4. 若资料不足，明确指出局限性。"""
+    SYSTEM_PROMPT = prompt_registry.render("academic_rag.system")
 
     @classmethod
     async def execute(cls, state: AgentState) -> Dict[str, Any]:
@@ -60,7 +57,8 @@ class AcademicRAGAgent(SubAgent):
 
         model = ModelRouter.route_model("academic_rag", len(prompt))
         messages = [
-            {"role": "system", "content": cls.SYSTEM_PROMPT},
+            {"role": "system", "content": prompt_router.build_system(
+                "academic_rag.system", query, user_id=state.get("user_id"))},
             {"role": "user", "content": prompt}
         ]
 
