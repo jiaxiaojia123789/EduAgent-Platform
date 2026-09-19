@@ -178,9 +178,6 @@ flowchart TD
 
 ### 交互特性
 
-* **Gemini 风格字体**：`next/font` 加载 Roboto（拉丁）+ Noto Sans SC（中文），字体栈 `Google Sans → Roboto → Noto Sans SC → 苹方/雅黑`，字体自托管；
-* **对话页品牌水印**：AI 教育主视觉（`public/content.png`）以 14% 透明度居中偏下铺设，径向遮罩柔化边缘，`pointer-events-none` 不拦截交互，消息气泡保持不透明白底；
-* 左侧边栏智能体名称加粗（font-bold）；列表默认显示前 5 个，其余下拉展开；
 * SSE 流式：思考轨迹折叠面板（ThinkingAccordion）、Plan DAG 节点状态实时更新（RUNNING→DONE）、Token 级打字效果；
 * KaTeX 实时渲染 `$...$` / `$$...$$`；文献引用 Hover 浮层；
 * 教学成果（Artifact Canvas）右侧滑出，支持导出 Word（python-docx）与 PDF（reportlab）。
