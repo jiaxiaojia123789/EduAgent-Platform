@@ -1,0 +1,263 @@
+"""
+Celery 应用与 Worker 任务定义
+解决 FastAPI BackgroundTasks 无法跨进程扩展、无法持久化的痛点
+架构：
+  - FastAPI 进程负责接收请求 -> 投递到 Celery 队列 -> 立即返回 task_id
+  - Celery Worker 进程消费任务 -> 执行 graph_engine -> 通过 Redis Pub/Sub 推送 SSE 事件
+  - FastAPI SSE 端点订阅 Redis channel -> 转发给前端
+
+启动 worker:
+    celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=4
+启动 flower 监控:
+    celery -A app.core.celery_app.celery_app flower
+"""
+import asyncio
+import json
+import logging
+import os
+from typing import Optional, Dict, Any, List
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+try:
+    from celery import Celery
+    _HAS_CELERY = True
+except ImportError:
+    Celery = None
+    _HAS_CELERY = False
+
+# Redis broker / backend URL 构造
+def _build_redis_url(db: Optional[int] = None) -> str:
+    pwd = f":{settings.REDIS_PASSWORD}@" if settings.REDIS_PASSWORD else ""
+    return f"redis://{pwd}{settings.REDIS_HOST}:{settings.REDIS_PORT}/{db if db is not None else settings.REDIS_DB}"
+
+BROKER_URL = _build_redis_url(settings.REDIS_DB)
+RESULT_BACKEND_URL = _build_redis_url(settings.REDIS_DB + 1 if settings.REDIS_DB < 15 else settings.REDIS_DB)
+EVENT_BUS_PREFIX = "sse:task"
+
+celery_app: Optional["Celery"] = None
+
+if _HAS_CELERY:
+    celery_app = Celery(
+        "edu_agent_worker",
+        broker=BROKER_URL,
+        backend=RESULT_BACKEND_URL,
+    )
+
+    celery_app.conf.update(
+        # 序列化与结果
+        task_serializer="json",
+        result_serializer="json",
+        accept_content=["json"],
+        result_expires=3600,  # 结果保留 1 小时
+        # 任务路由：长任务走专用队列
+        task_routes={
+            "agent.run_workflow": {"queue": "agent_heavy"},
+            "agent.run_sync": {"queue": "agent_light"},
+        },
+        task_default_queue="default",
+        # 并发：基于 asyncio 池，每 worker 可处理多协程
+        worker_concurrency=4,
+        task_acks_late=True,  # 任务完成后才 ack，崩溃时自动重投递
+        task_reject_on_worker_lost=True,
+        # 可靠性：可见性超时（防止任务被重复消费）
+        broker_transport_options={"visibility_timeout": 1800},
+        # 监控
+        worker_send_task_events=True,
+        task_send_sent_event=True,
+        worker_prefetch_multiplier=1,  # 长任务场景下避免一个 worker 抢占过多任务
+        # 优雅关闭
+        worker_max_tasks_per_child=200,  # 防止内存泄漏
+    )
+
+    @celery_app.task(name="agent.run_workflow", bind=True, max_retries=2, default_retry_delay=10)
+    def run_agent_workflow_task(
+        self,
+        task_id: str,
+        user_message: str,
+        session_id: str,
+        thread_id: str,
+        user_id: str = "u-001",
+        user_role: str = "teacher",
+        agent_type: str = "supervisor",
+        kb_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Celery 任务：执行 Agent 多智能体工作流
+        所有 SSE 事件通过 Redis Pub/Sub 推送到 channel 'sse:task:{task_id}'
+        """
+        # Celery 5.x 同步上下文，需要在新事件循环里跑 asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                _async_run_workflow(
+                    task_id=task_id,
+                    user_message=user_message,
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    user_role=user_role,
+                    agent_type=agent_type,
+                    kb_ids=kb_ids,
+                )
+            )
+            return result
+        except Exception as e:
+            logger.exception(f"[Celery Task {task_id}] 执行失败: {e}")
+            loop.run_until_complete(_publish_event(task_id, {
+                "event_type": "error",
+                "task_id": task_id,
+                "payload": {"error": str(e), "task_id": task_id}
+            }))
+            # 重试（指数退避由 default_retry_delay + Celery 内部退避机制）
+            raise self.retry(exc=e, countdown=10 * (self.request.retries + 1))
+        finally:
+            loop.close()
+
+
+    async def _async_run_workflow(
+        task_id: str,
+        user_message: str,
+        session_id: str,
+        thread_id: str,
+        user_id: str,
+        user_role: str,
+        agent_type: str,
+        kb_ids: Optional[List[str]],
+    ) -> Dict[str, Any]:
+        # 延迟导入避免循环依赖
+        from app.services.agent.graph import graph_engine
+        from app.harness.base import AgentHarness
+        from app.services.task_queue.redis_task_store import redis_task_store
+
+        harness = AgentHarness(session_id=session_id, user_role=user_role)
+
+        # 事件回调：把思维链步骤实时推送到 Redis Pub/Sub
+        async def event_callback(event: Dict[str, Any]):
+            await _publish_event(task_id, event)
+
+        # 更新任务状态为 RUNNING
+        await redis_task_store.update_status(task_id, "RUNNING", current_node="Supervisor")
+
+        try:
+            result = await graph_engine.run_workflow(
+                user_message=user_message,
+                session_id=session_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                user_role=user_role,
+                explicit_agent=agent_type,
+                kb_ids=kb_ids,
+                harness=harness,
+                event_callback=event_callback,
+            )
+            # 写回 Redis
+            await redis_task_store.complete_task(task_id, result)
+            # 推送结束事件
+            if result.get("artifact"):
+                await _publish_event(task_id, {
+                    "event_type": "artifact",
+                    "task_id": task_id,
+                    "payload": result["artifact"]
+                })
+            await _publish_event(task_id, {
+                "event_type": "done",
+                "task_id": task_id,
+                "payload": {
+                    "output": result["output"],
+                    "citations": result.get("citations", []),
+                    "agent_type": result.get("agent_type"),
+                }
+            })
+            return result
+        except Exception as e:
+            await redis_task_store.fail_task(task_id, str(e))
+            await _publish_event(task_id, {
+                "event_type": "error",
+                "task_id": task_id,
+                "payload": {"error": str(e), "task_id": task_id}
+            })
+            raise
+
+
+    async def _publish_event(task_id: str, event: Dict[str, Any]) -> None:
+        """
+        将事件发布到 Redis Pub/Sub channel 'sse:task:{task_id}'
+        FastAPI SSE 端点订阅该 channel 转发给前端
+        同时写入 Redis List 用于客户端断线重连补偿
+        """
+        from app.core.redis_client import redis_manager
+        channel = f"{EVENT_BUS_PREFIX}:{task_id}"
+        event_json = json.dumps(event, ensure_ascii=False, default=str)
+
+        if redis_manager.is_connected and redis_manager.client:
+            try:
+                # Pub/Sub 实时推送
+                await redis_manager.client.publish(channel, event_json)
+                # List 暂存最近 64 条事件，供重连补偿
+                list_key = f"events:{task_id}"
+                await redis_manager.client.rpush(list_key, event_json)
+                await redis_manager.client.ltrim(list_key, -64, -1)
+                await redis_manager.client.expire(list_key, 3600)
+            except Exception as e:
+                logger.error(f"[Celery Event] 发布事件失败 task={task_id}: {e}")
+        else:
+            logger.debug(f"[Celery Event] (内存模式) task={task_id} event={event.get('event_type')}")
+else:
+    logger.warning("[CeleryApp] celery 包未安装，worker 任务不可用")
+
+
+async def subscribe_task_events(task_id: str):
+    """
+    FastAPI SSE 端点调用此函数订阅 task 事件流
+    生成器模式，yield 标准的 SSE data 字符串
+    """
+    from app.core.redis_client import redis_manager
+
+    channel = f"{EVENT_BUS_PREFIX}:{task_id}"
+    list_key = f"events:{task_id}"
+
+    # 1. 先读取 List 中的历史事件（断线重连补偿）
+    if redis_manager.is_connected and redis_manager.client:
+        try:
+            history = await redis_manager.client.lrange(list_key, 0, -1)
+            for item in history:
+                yield f"data: {item}\n\n"
+                try:
+                    parsed = json.loads(item)
+                    if parsed.get("event_type") in ("done", "error"):
+                        return
+                except Exception:
+                    pass
+
+            # 2. 订阅 Pub/Sub 接收后续实时事件
+            pubsub = redis_manager.client.pubsub()
+            await pubsub.subscribe(channel)
+            try:
+                # 带 keep-alive 的循环
+                import asyncio
+                while True:
+                    try:
+                        message = await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True), timeout=30.0)
+                        if message and message.get("type") == "message":
+                            data = message.get("data", "")
+                            yield f"data: {data}\n\n"
+                            try:
+                                parsed = json.loads(data)
+                                if parsed.get("event_type") in ("done", "error"):
+                                    return
+                            except Exception:
+                                pass
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+            finally:
+                await pubsub.unsubscribe(channel)
+                await pubsub.close()
+        except Exception as e:
+            logger.error(f"[SSE Subscribe] 订阅失败: {e}")
+            yield f"data: {{\"event_type\": \"error\", \"payload\": {{\"error\": \"订阅失败: {str(e)}\"}}}}\n\n"
+    else:
+        yield f"data: {{\"event_type\": \"error\", \"payload\": {{\"error\": \"Redis 未连接，无法接收实时事件\"}}}}\n\n"

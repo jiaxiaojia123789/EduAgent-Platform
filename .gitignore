@@ -1,0 +1,55 @@
+# Environment variables / Secrets
+.env
+.env.local
+.env.development
+.env.production
+.env.*.local
+
+# Keep template
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+backend/data/*
+!backend/data/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Runtime / Upload / Cache
+uploads/
+cache/
+tmp/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker runtime data
+docker/data/

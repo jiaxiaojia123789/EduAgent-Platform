@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css";
+
+:root {
+  --foreground-rgb: 30, 41, 59;
+  --background-rgb: 247, 249, 252;
+}
+
+body {
+  color: rgb(var(--foreground-rgb));
+  background-color: rgb(var(--background-rgb));
+  /* Gemini 风格字体栈：Google Sans（Gemini 实际字体，多数设备无此字体则向下回退）
+     → Roboto（拉丁）→ Noto Sans SC（中文）→ 系统无衬线 */
+  font-family: "Google Sans Text", "Google Sans", var(--font-roboto), var(--font-noto-sans-sc),
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "微软雅黑",
+    system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 代码块/行内代码保留等宽字体（宋体不含等宽字形，代码可读性差） */
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+
+/* Custom smooth scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* 登录卡片入场动画 */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

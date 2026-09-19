@@ -1,0 +1,45 @@
+fastapi==0.115.0
+uvicorn[standard]==0.31.0
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-multipart==0.0.12
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.0
+
+# Database & Cache
+sqlalchemy==2.0.35
+asyncpg==0.29.0
+alembic==1.13.3
+redis==5.1.1                # 用于：异步任务 broker / 幂等锁 / SSE Pub/Sub / LangGraph 持久化 checkpointer
+celery==5.4.0              # 用于：企业级分布式任务队列，独立 worker 进程消费长任务
+eventlet==0.37.0           # 用于：Windows 下 Celery worker 的并发池（替代 gevent，-P eventlet）
+flower==2.0.0              # 用于：Celery 任务可视化监控面板（默认 http://localhost:5555）
+
+# Vector Database & Retrieval
+pymilvus==2.4.6
+rank_bm25==0.2.2
+numpy==1.26.4
+
+# LLM, Agent & Orchestration
+dashscope==1.20.10
+openai==1.51.0
+langchain==0.3.1
+langchain-core==0.3.6
+langchain-community==0.3.1
+langgraph==0.2.34
+langfuse==2.50.0           # 用于：trace/span 观测推送到 Langfuse 云端
+
+# Document & Content Processing
+python-docx==1.1.2
+pypdf==5.0.1
+markdown==3.7
+reportlab==4.2.5
+requests==2.32.3
+httpx==0.27.2
+aiofiles==24.1.0
+
+# Testing & Quality
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-mock==3.14.0

@@ -1,0 +1,184 @@
+version: '3.8'
+
+services:
+  # ============================================================================
+  # Milvus 2.4 Standalone Architecture (etcd + minio + standalone)
+  # ============================================================================
+  milvus-etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - milvus_etcd_data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir=/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  milvus-minio:
+    container_name: milvus-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - milvus_minio_data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  milvus-standalone:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.4.6
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    volumes:
+      - milvus_data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - "milvus-etcd"
+      - "milvus-minio"
+
+  # ============================================================================
+  # Relational Database & Cache
+  # ============================================================================
+  postgres:
+    container_name: edu-postgres
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: edu_agent_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d edu_agent_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    container_name: edu-redis
+    image: redis:7-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================================
+  # EduAgent-Platform Backend & Frontend
+  # ============================================================================
+  backend:
+    container_name: edu-backend
+    build:
+      context: ../backend
+      dockerfile: ../docker/Dockerfile.backend
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql+asyncpg://postgres:password123@postgres:5432/edu_agent_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MILVUS_HOST=milvus-standalone
+      - MILVUS_PORT=19530
+      - MINIO_ENDPOINT=milvus-minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      milvus-standalone:
+        condition: service_healthy
+
+  # ============================================================================
+  # Celery Worker（消费 agent_heavy 队列的长任务）
+  # ============================================================================
+  celery-worker:
+    container_name: edu-celery-worker
+    build:
+      context: ../backend
+      dockerfile: ../docker/Dockerfile.backend
+    restart: always
+    command: celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=4 -P eventlet -Q agent_heavy,default
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql+asyncpg://postgres:password123@postgres:5432/edu_agent_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MILVUS_HOST=milvus-standalone
+      - MILVUS_PORT=19530
+      - MINIO_ENDPOINT=milvus-minio:9000
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  # Flower 监控面板（默认 http://localhost:5555）
+  celery-flower:
+    container_name: edu-celery-flower
+    image: mher/flower:2.0
+    restart: always
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      - celery-worker
+
+  frontend:
+    container_name: edu-frontend
+    build:
+      context: ../frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+
+volumes:
+  milvus_etcd_data:
+  milvus_minio_data:
+  milvus_data:
+  postgres_data:
+  redis_data:
