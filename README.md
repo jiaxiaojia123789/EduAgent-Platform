@@ -29,117 +29,7 @@ EduAgent-Platform 采用 **分层式 Agentic AI 架构**，围绕「用户交互
 
 ### Architecture Overview
 
-```mermaid
-flowchart TB
-
-    %% ================= 用户层 =================
-    USER["👤 Teacher / Researcher / Admin"]
-
-    %% ================= 表现层 =================
-    subgraph UI["🖥️ 1. Presentation Layer · AI 教学工作台"]
-        direction LR
-        CHAT["💬 Agent Chat<br/>SSE 流式交互"]
-        DAG["🔀 Plan DAG<br/>任务执行可视化"]
-        CANVAS["📄 Artifact Canvas<br/>教学成果预览"]
-        KB["📚 Knowledge Center<br/>知识库管理"]
-        TOOLUI["🧰 Tool Center<br/>MCP / Skills"]
-    end
-
-    %% ================= 网关层 =================
-    subgraph API["⚡ 2. Gateway Layer · FastAPI"]
-        direction LR
-        AUTH["🔐 JWT / RBAC"]
-        SSE["📡 SSE Streaming"]
-        REST["🔌 REST API"]
-        QUEUE["📨 Celery / Redis"]
-    end
-
-    %% ================= 协作层 =================
-    subgraph CORE["🧠 3. Multi-Agent Collaboration Core"]
-        direction LR
-        GATE["🚦 Intent Gate<br/>trivial / compound"]
-        PLAN["📝 Planner<br/>Task → DAG"]
-        SCHEDULER["⚙️ Resource Scheduler<br/>Wave Parallelism"]
-        LOCK["🔒 File Lock + MVCC"]
-        REFLECT["🔍 Reflect<br/>Quality Review"]
-        CONTEXT["🧠 Context Manager<br/>三级上下文压缩"]
-    end
-
-    %% ================= Harness =================
-    subgraph HARNESS["🛡️ 4. Agent Harness · 安全执行底座"]
-        direction LR
-        SANDBOX["📦 Sandbox<br/>Step / Token / Timeout"]
-        GUARD["🛡️ Guardrails<br/>Injection / PII"]
-        RBAC["🔑 Tool Authorizer<br/>RBAC / HITL"]
-        WATCHDOG["⏱️ Watchdog<br/>Timeout Kill"]
-        TELEMETRY["📊 Telemetry<br/>Trace / Benchmark"]
-    end
-
-    %% ================= Agent =================
-    subgraph AGENTS["🤖 5. Agent Matrix · 1 + 9"]
-        SUPERVISOR["🧠 Supervisor<br/>中台总控"]
-
-        EXPERTS["👥 Expert Agents<br/>
-        教案 · 学术 · 命题 · 苏格拉底 · 数理<br/>
-        课标 · 批改 · 课件 · 代码"]
-    end
-
-    %% ================= RAG =================
-    subgraph RAG["🔎 6. Hybrid RAG Pipeline"]
-        direction LR
-        PARSE["📑 MinerU<br/>Document Parsing"]
-        CHUNK["✂️ Smart Chunking"]
-        RETRIEVE["🔍 Dense + BM25"]
-        RRF["🔀 RRF Fusion"]
-        RERANK["🎯 BGE Reranker"]
-        GROUND["✅ Grounding<br/>Citation"]
-    end
-
-    %% ================= Models / Tools =================
-    subgraph INFRA["☁️ Model & Tool Infrastructure"]
-        direction LR
-        QWEN["✨ Qwen Models<br/>DashScope"]
-        MILVUS["🗄️ Milvus<br/>Vector DB"]
-        MCP["🔌 MCP Tools"]
-        SKILLS["🧩 Teaching Skills"]
-    end
-
-    USER --> UI
-    UI --> API
-
-    API --> GATE
-
-    GATE -->|"Simple Task"| SUPERVISOR
-    GATE -->|"Compound Task"| PLAN
-
-    PLAN --> SCHEDULER
-    SCHEDULER --> LOCK
-    LOCK --> SUPERVISOR
-
-    SUPERVISOR --> EXPERTS
-
-    CORE --> HARNESS
-    EXPERTS --> HARNESS
-
-    EXPERTS --> RAG
-
-    PARSE --> CHUNK
-    CHUNK --> RETRIEVE
-    RETRIEVE --> RRF
-    RRF --> RERANK
-    RERANK --> GROUND
-
-    AGENTS --> QWEN
-    RAG --> MILVUS
-    HARNESS --> MCP
-    HARNESS --> SKILLS
-
-    EXPERTS --> REFLECT
-    REFLECT -->|"Pass"| API
-    REFLECT -->|"Retry"| SCHEDULER
-
-    API --> UI
-```
+![Architecture Overview · EduAgent-Platform 系统总体架构](assets/Architecture_Overview.png)
 
 ---
 
@@ -147,58 +37,7 @@ flowchart TB
 
 EduAgent-Platform 根据任务复杂度采用 **单 Agent 直达 + Multi-Agent DAG 协作** 的双路径执行机制。
 
-```text
-User Request
-     │
-     ▼
-┌─────────────────────┐
-│     Intent Gate     │
-│ trivial / compound  │
-└─────────┬───────────┘
-          │
-     ┌────┴────┐
-     │         │
- trivial    compound
-     │         │
-     ▼         ▼
-Single Agent   Planner
-     │         │
-     │         ▼
-     │      Task DAG
-     │         │
-     │         ▼
-     │   Resource Scheduler
-     │         │
-     │    Wave Parallel
-     │         │
-     └────┬────┘
-          ▼
-    Expert Agents
-          │
-          ├──────────► Hybrid RAG
-          │
-          ├──────────► MCP Tools
-          │
-          ├──────────► Teaching Skills
-          │
-          └──────────► Code Sandbox
-          │
-          ▼
-       Reflect
-          │
-     ┌────┴────┐
-     │         │
-    Pass      Retry
-     │         │
-     ▼         └──────► Scheduler
-Artifact
-     │
-     ▼
-SSE Streaming
-     │
-     ▼
-     User
-```
+![核心执行链路 · Multi-Agent 任务执行流程](assets/核心执行链路.png)
 
 简单任务由专业 Agent 直接处理，避免不必要的规划开销；复合任务则进入 **Plan → DAG → Resource Scheduler → Multi-Agent → Reflect** 协作链路，并根据资源依赖关系进行拓扑分层和波次并行执行。
 
@@ -290,35 +129,7 @@ flowchart LR
 
 核心检索流程：
 
-```text
-Document
-   ↓
-MinerU Layout Parsing
-   ↓
-Formula / Table Preservation
-   ↓
-Smart Chunking
-   ↓
-┌──────────────────────┐
-│                      │
-▼                      ▼
-Milvus HNSW           BM25
-Dense Retrieval       Sparse Retrieval
-│                      │
-└──────────┬───────────┘
-           ▼
-       RRF Fusion
-           ↓
-        Top-30
-           ↓
-     BGE Reranker
-           ↓
-         Top-5
-           ↓
-       Grounding
-           ↓
-Citation-aware Answer
-```
+![核心检索流程 · Hybrid RAG Pipeline](assets/核心检索流程.png)
 
 ---
 
@@ -326,26 +137,7 @@ Citation-aware Answer
 
 所有 Agent、模型和外部工具调用统一经过 **Agent Harness**，将安全、权限、超时和可观测能力从具体 Agent 逻辑中解耦。
 
-```text
-                    Agent
-                      │
-                      ▼
-            ┌──────────────────┐
-            │  Agent Harness   │
-            ├──────────────────┤
-            │ Sandbox          │
-            │ Guardrails       │
-            │ Tool Authorizer  │
-            │ Call Fingerprint │
-            │ Watchdog         │
-            │ Telemetry        │
-            │ Benchmark        │
-            └────────┬─────────┘
-                     │
-        ┌────────────┼────────────┐
-        ▼            ▼            ▼
-      LLM          MCP Tool    Code Sandbox
-```
+![Agent Harness · 安全执行底座](assets/Agent%20Harness.png)
 
 Harness 负责统一实施：
 
