@@ -222,15 +222,7 @@ Harness 负责统一实施：
 
 ## 🔎 高级混合 RAG 流水线
 
-```
-文档 → MinerU 版面解析(OCR/公式LaTeX/表格MD)
-     → 分块(6 策略: semantic/fixed/markdown_header/qa/recursive/sentence)
-     → text-embedding-v3 向量化(1024 维)
-     → Milvus HNSW 稠密召回 ‖ BM25 稀疏精确召回
-     → RRF 倒数排名融合(初筛 Top-30)
-     → BGE-Reranker-Large Cross-Encoder 精排(Top-5)
-     → Grounding 事实接地校验 + 引用锚点
-```
+![高级混合 RAG 流水线 · Hybrid RAG Pipeline](assets/高级混合%20RAG%20流水线.png)
 
 * **动态分块配置**：按文档类型自动映射策略（PDF→semantic 512+64 / MD→markdown_header / TXT→recursive 等），前端支持参数滑块与 Dry-run 切片预览；
 * **Milvus 集合** `edu_knowledge_chunks`：HNSW（M=16, efConstruction=200）+ 学科/学段倒排索引；
