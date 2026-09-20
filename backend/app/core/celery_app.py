@@ -39,6 +39,33 @@ EVENT_BUS_PREFIX = "sse:task"
 
 celery_app: Optional["Celery"] = None
 
+
+async def publish_task_event(task_id: str, event: Dict[str, Any]) -> None:
+    """
+    将事件发布到任务事件总线（模块级，Celery worker 与 fallback 执行器共用）：
+    - Redis 可用：Pub/Sub 实时推送 + List 暂存最近 64 条（断线重连补偿）
+    - Redis 不可用：走进程内 InProcEventBus（仅单进程 fallback 有效）
+    """
+    from app.core.redis_client import redis_manager
+    from app.services.task_queue.inproc_event_bus import inproc_bus
+
+    event_json = json.dumps(event, ensure_ascii=False, default=str)
+
+    if redis_manager.is_connected and redis_manager.client:
+        channel = f"{EVENT_BUS_PREFIX}:{task_id}"
+        try:
+            await redis_manager.client.publish(channel, event_json)
+            list_key = f"events:{task_id}"
+            await redis_manager.client.rpush(list_key, event_json)
+            await redis_manager.client.ltrim(list_key, -64, -1)
+            await redis_manager.client.expire(list_key, 3600)
+        except Exception as e:
+            logger.error(f"[TaskEvent] Redis 发布失败 task={task_id}: {e}")
+    else:
+        # 无 Redis：进程内总线（BackgroundTasks fallback 与 SSE 端点同进程）
+        await inproc_bus.publish(task_id, event_json)
+
+
 if _HAS_CELERY:
     celery_app = Celery(
         "edu_agent_worker",
@@ -83,10 +110,12 @@ if _HAS_CELERY:
         user_role: str = "teacher",
         agent_type: str = "supervisor",
         kb_ids: Optional[List[str]] = None,
+        conversation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Celery 任务：执行 Agent 多智能体工作流
         所有 SSE 事件通过 Redis Pub/Sub 推送到 channel 'sse:task:{task_id}'
+        conversation_id 用于任务终态时把 assistant 结果补写到历史对话库
         """
         # Celery 5.x 同步上下文，需要在新事件循环里跑 asyncio
         loop = asyncio.new_event_loop()
@@ -102,6 +131,7 @@ if _HAS_CELERY:
                     user_role=user_role,
                     agent_type=agent_type,
                     kb_ids=kb_ids,
+                    conversation_id=conversation_id,
                 )
             )
             return result
@@ -127,11 +157,20 @@ if _HAS_CELERY:
         user_role: str,
         agent_type: str,
         kb_ids: Optional[List[str]],
+        conversation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         # 延迟导入避免循环依赖
         from app.services.agent.graph import graph_engine
         from app.harness.base import AgentHarness
         from app.services.task_queue.redis_task_store import redis_task_store
+        from app.services.task_queue.result_persistence import (
+            bind_conversation,
+            build_done_payload,
+            friendly_error_message,
+            persist_task_failure,
+            persist_task_result,
+            persist_user_message,
+        )
 
         harness = AgentHarness(session_id=session_id, user_role=user_role)
 
@@ -141,6 +180,12 @@ if _HAS_CELERY:
 
         # 更新任务状态为 RUNNING
         await redis_task_store.update_status(task_id, "RUNNING", current_node="Supervisor")
+
+        # 绑定历史对话并落用户消息（conversation_id 为空时新建，done 时回传前端）
+        conversation_id = bind_conversation(
+            conversation_id, user_id, agent_type, session_id, thread_id
+        )
+        persist_user_message(conversation_id, user_message)
 
         try:
             result = await graph_engine.run_workflow(
@@ -156,6 +201,8 @@ if _HAS_CELERY:
             )
             # 写回 Redis
             await redis_task_store.complete_task(task_id, result)
+            # assistant 结果补写历史对话库（与 /sync-run 契约一致）
+            persist_task_result(conversation_id, result)
             # 推送结束事件
             if result.get("artifact"):
                 await _publish_event(task_id, {
@@ -166,46 +213,27 @@ if _HAS_CELERY:
             await _publish_event(task_id, {
                 "event_type": "done",
                 "task_id": task_id,
-                "payload": {
-                    "output": result["output"],
-                    "citations": result.get("citations", []),
-                    "agent_type": result.get("agent_type"),
-                }
+                "payload": build_done_payload(conversation_id, result)
             })
             return result
         except Exception as e:
             await redis_task_store.fail_task(task_id, str(e))
+            persist_task_failure(conversation_id, str(e), agent_type)
             await _publish_event(task_id, {
                 "event_type": "error",
                 "task_id": task_id,
-                "payload": {"error": str(e), "task_id": task_id}
+                "payload": {
+                    "error": friendly_error_message(str(e)),
+                    "raw_error": str(e)[:500],
+                    "conversation_id": conversation_id,
+                    "task_id": task_id,
+                }
             })
             raise
 
 
-    async def _publish_event(task_id: str, event: Dict[str, Any]) -> None:
-        """
-        将事件发布到 Redis Pub/Sub channel 'sse:task:{task_id}'
-        FastAPI SSE 端点订阅该 channel 转发给前端
-        同时写入 Redis List 用于客户端断线重连补偿
-        """
-        from app.core.redis_client import redis_manager
-        channel = f"{EVENT_BUS_PREFIX}:{task_id}"
-        event_json = json.dumps(event, ensure_ascii=False, default=str)
-
-        if redis_manager.is_connected and redis_manager.client:
-            try:
-                # Pub/Sub 实时推送
-                await redis_manager.client.publish(channel, event_json)
-                # List 暂存最近 64 条事件，供重连补偿
-                list_key = f"events:{task_id}"
-                await redis_manager.client.rpush(list_key, event_json)
-                await redis_manager.client.ltrim(list_key, -64, -1)
-                await redis_manager.client.expire(list_key, 3600)
-            except Exception as e:
-                logger.error(f"[Celery Event] 发布事件失败 task={task_id}: {e}")
-        else:
-            logger.debug(f"[Celery Event] (内存模式) task={task_id} event={event.get('event_type')}")
+    # 发布函数定义在模块级（celery 包缺失时 fallback 执行器仍可 import）
+    _publish_event = publish_task_event
 else:
     logger.warning("[CeleryApp] celery 包未安装，worker 任务不可用")
 
@@ -213,51 +241,60 @@ else:
 async def subscribe_task_events(task_id: str):
     """
     FastAPI SSE 端点调用此函数订阅 task 事件流
-    生成器模式，yield 标准的 SSE data 字符串
+    生成器模式，yield 标准的 SSE data 字符串（data 始终为 JSON 字符串，前端固定 JSON.parse）
     """
     from app.core.redis_client import redis_manager
 
     channel = f"{EVENT_BUS_PREFIX}:{task_id}"
     list_key = f"events:{task_id}"
 
-    # 1. 先读取 List 中的历史事件（断线重连补偿）
-    if redis_manager.is_connected and redis_manager.client:
-        try:
-            history = await redis_manager.client.lrange(list_key, 0, -1)
-            for item in history:
-                yield f"data: {item}\n\n"
-                try:
-                    parsed = json.loads(item)
-                    if parsed.get("event_type") in ("done", "error"):
-                        return
-                except Exception:
-                    pass
+    # Redis 不可用：进程内总线（与 fallback 执行器同进程，支持本地无 Redis 开发）
+    if not (redis_manager.is_connected and redis_manager.client):
+        from app.services.task_queue.inproc_event_bus import inproc_bus
+        async for chunk in inproc_bus.subscribe(task_id):
+            yield chunk
+        return
 
-            # 2. 订阅 Pub/Sub 接收后续实时事件
-            pubsub = redis_manager.client.pubsub()
-            await pubsub.subscribe(channel)
+    # 1. 先读取 List 中的历史事件（断线重连补偿）
+    try:
+        history = await redis_manager.client.lrange(list_key, 0, -1)
+        for item in history:
+            yield f"data: {item}\n\n"
             try:
-                # 带 keep-alive 的循环
-                import asyncio
-                while True:
-                    try:
-                        message = await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True), timeout=30.0)
-                        if message and message.get("type") == "message":
-                            data = message.get("data", "")
-                            yield f"data: {data}\n\n"
-                            try:
-                                parsed = json.loads(data)
-                                if parsed.get("event_type") in ("done", "error"):
-                                    return
-                            except Exception:
-                                pass
-                    except asyncio.TimeoutError:
-                        yield ": keep-alive\n\n"
-            finally:
-                await pubsub.unsubscribe(channel)
-                await pubsub.close()
-        except Exception as e:
-            logger.error(f"[SSE Subscribe] 订阅失败: {e}")
-            yield f"data: {{\"event_type\": \"error\", \"payload\": {{\"error\": \"订阅失败: {str(e)}\"}}}}\n\n"
-    else:
-        yield f"data: {{\"event_type\": \"error\", \"payload\": {{\"error\": \"Redis 未连接，无法接收实时事件\"}}}}\n\n"
+                parsed = json.loads(item)
+                if parsed.get("event_type") in ("done", "error"):
+                    return
+            except Exception:
+                pass
+
+        # 2. 订阅 Pub/Sub 接收后续实时事件
+        pubsub = redis_manager.client.pubsub()
+        await pubsub.subscribe(channel)
+        try:
+            # 带 keep-alive 的循环
+            while True:
+                try:
+                    message = await asyncio.wait_for(
+                        pubsub.get_message(ignore_subscribe_messages=True), timeout=30.0
+                    )
+                    if message and message.get("type") == "message":
+                        data = message.get("data", "")
+                        yield f"data: {data}\n\n"
+                        try:
+                            parsed = json.loads(data)
+                            if parsed.get("event_type") in ("done", "error"):
+                                return
+                        except Exception:
+                            pass
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+        finally:
+            await pubsub.unsubscribe(channel)
+            await pubsub.close()
+    except Exception as e:
+        logger.error(f"[SSE Subscribe] 订阅失败: {e}")
+        err = json.dumps(
+            {"event_type": "error", "payload": {"error": f"订阅失败: {str(e)}"}},
+            ensure_ascii=False,
+        )
+        yield f"data: {err}\n\n"

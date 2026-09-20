@@ -65,11 +65,12 @@ class TaskManager:
         user_role: str = "teacher",
         agent_type: str = "supervisor",
         kb_ids: Optional[list] = None,
+        conversation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         提交任务到执行队列
         优先走 Celery，降级走 BackgroundTasks（在 api 层注入 background_tasks）
-        返回：{"dispatcher": "celery"/"fallback", "task_id": ...}
+        返回：{"dispatcher": "celery"/"fallback"/"duplicate", "task_id": ...}
         """
         # 1. 幂等锁：防止用户连击
         lock_key = f"agent:{session_id}:{thread_id}"
@@ -99,6 +100,7 @@ class TaskManager:
                         "user_role": user_role,
                         "agent_type": agent_type,
                         "kb_ids": kb_ids,
+                        "conversation_id": conversation_id,
                     },
                     queue="agent_heavy",
                 )
@@ -124,11 +126,12 @@ class TaskManager:
         user_id: str = "u-001",
         user_role: str = "teacher",
         kb_ids: Optional[list] = None,
+        conversation_id: Optional[str] = None,
     ):
         """
         进程内 fallback 执行器
         当 Celery 不可用时由 FastAPI BackgroundTasks 调用
-        仍然通过 Redis Pub/Sub 推送事件，SSE 体验一致
+        仍然通过任务事件总线（Redis 或进程内）推送事件，SSE 体验一致
         """
         task = await redis_task_store.get_task(task_id)
         if not task:
@@ -139,14 +142,34 @@ class TaskManager:
         try:
             from app.services.agent.graph import graph_engine
             from app.harness.base import AgentHarness
-            from app.core.celery_app import _publish_event
+            from app.core.celery_app import publish_task_event
+            from app.services.task_queue.result_persistence import (
+                bind_conversation,
+                build_done_payload,
+                friendly_error_message,
+                persist_task_failure,
+                persist_task_result,
+                persist_user_message,
+            )
 
             harness = AgentHarness(session_id=task["session_id"], user_role=user_role)
 
             async def event_callback(event: Dict[str, Any]):
                 # 覆盖 task_id（graph_engine 内部用 session_id 占位）
                 event["task_id"] = task_id
-                await _publish_event(task_id, event)
+                await publish_task_event(task_id, event)
+
+            await redis_task_store.update_status(task_id, "RUNNING", current_node="Supervisor")
+
+            # 绑定历史对话并落用户消息（conversation_id 为空时新建，done 时回传前端）
+            conversation_id = bind_conversation(
+                conversation_id,
+                user_id,
+                task["agent_type"],
+                task["session_id"],
+                task["thread_id"],
+            )
+            persist_user_message(conversation_id, user_message)
 
             result = await graph_engine.run_workflow(
                 user_message=user_message,
@@ -161,36 +184,45 @@ class TaskManager:
             )
 
             await redis_task_store.complete_task(task_id, result)
+            # assistant 结果补写历史对话库（与 /sync-run 契约一致）
+            persist_task_result(conversation_id, result)
 
             # 推送结束事件
             if result.get("artifact"):
-                await _publish_event(task_id, {
+                await publish_task_event(task_id, {
                     "event_type": "artifact",
                     "task_id": task_id,
                     "payload": result["artifact"]
                 })
-            await _publish_event(task_id, {
+            await publish_task_event(task_id, {
                 "event_type": "done",
                 "task_id": task_id,
-                "payload": {
-                    "output": result["output"],
-                    "citations": result.get("citations", []),
-                    "agent_type": result.get("agent_type"),
-                }
+                "payload": build_done_payload(conversation_id, result)
             })
 
         except Exception as e:
             logger.exception(f"[TaskManager] Fallback 执行失败 task={task_id}")
             await redis_task_store.fail_task(task_id, str(e))
             try:
-                from app.core.celery_app import _publish_event
-                await _publish_event(task_id, {
+                from app.core.celery_app import publish_task_event
+                from app.services.task_queue.result_persistence import (
+                    friendly_error_message,
+                    persist_task_failure,
+                )
+                agent_type = (task or {}).get("agent_type", "supervisor")
+                persist_task_failure(conversation_id, str(e), agent_type)
+                await publish_task_event(task_id, {
                     "event_type": "error",
                     "task_id": task_id,
-                    "payload": {"error": str(e), "task_id": task_id}
+                    "payload": {
+                        "error": friendly_error_message(str(e)),
+                        "raw_error": str(e)[:500],
+                        "conversation_id": conversation_id,
+                        "task_id": task_id,
+                    }
                 })
             except Exception:
-                pass
+                logger.exception(f"[TaskManager] 失败事件发布失败 task={task_id}")
 
     async def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
         """从 Redis 读取任务状态"""

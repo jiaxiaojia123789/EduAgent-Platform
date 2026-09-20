@@ -35,13 +35,35 @@ function preprocessMarkdown(raw: string): string {
   }
   return result.join("\n");
 }
+
+/**
+ * 将后端 trace 事件（{step_id?, node_name?, phase?, action, title, elapsed_ms?}）
+ * 归并为前端 ThinkingAccordion 需要的 TraceStep：
+ * - 有 step_id：TOOL_RESULT_DONE 等终态事件覆盖更新进行中的同名步骤；
+ * - 无 step_id：用 node/phase + title 合成稳定 key，避免重复插入。
+ */
+function mergeTraceStep(steps: TraceStep[], p: any): TraceStep[] {
+  const stepId = p.step_id || `${p.node_name || p.phase || "agent"}::${p.title || ""}`;
+  const next: TraceStep = {
+    step_id: stepId,
+    node_name: p.node_name || p.phase || "Supervisor",
+    action_type: p.action || "THINKING",
+    title: p.title || "",
+    elapsed_ms: p.elapsed_ms
+  };
+  const idx = steps.findIndex((s) => s.step_id === stepId);
+  if (idx === -1) return [...steps, next];
+  const merged = [...steps];
+  merged[idx] = { ...steps[idx], ...next };
+  return merged;
+}
 import { AgentSidebar } from "@/components/sidebar/AgentSidebar";
 import { ThinkingAccordion } from "@/components/chat/ThinkingAccordion";
 import { CitationPopover } from "@/components/chat/CitationPopover";
 import { ArtifactCanvas } from "@/components/canvas/ArtifactCanvas";
 import { MemoryDrawer } from "@/components/memory/MemoryDrawer";
 import {
-  fetchAgentMatrix, runAgentSync, AgentInfo, MessageItem,
+  fetchAgentMatrix, runAgentStream, AgentInfo, MessageItem, TraceStep,
   getAuthToken, getCurrentUser, clearAuthToken, getStoredUser,
   fetchMemoryItems, UserInfo, PlanDAG, SubAgentResultSchema,
   ConversationMeta, StoredMessage,
@@ -58,6 +80,9 @@ export default function DoubaoEducationalWorkspace() {
   const [isCanvasOpen, setIsCanvasOpen] = useState(false);
   const [activeKbId, setActiveKbId] = useState<string>("kb-math-01");
   const [uploadingDoc, setUploadingDoc] = useState<boolean>(false);
+
+  // 当前流式任务的中断控制器（新建对话时中止旧流）
+  const streamAbortRef = useRef<AbortController | null>(null);
 
   // 历史对话状态
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -129,6 +154,10 @@ export default function DoubaoEducationalWorkspace() {
 
   /** 打开并恢复某条历史对话 */
   const handleOpenConversation = async (conversationId: string) => {
+    // 切换到历史会话：中断可能仍在进行的流式任务
+    streamAbortRef.current?.abort();
+    streamAbortRef.current = null;
+    setLoading(false);
     try {
       const { messages: stored } = await fetchConversationDetail(conversationId);
       const restored = stored
@@ -242,9 +271,12 @@ export default function DoubaoEducationalWorkspace() {
     } catch {}
   }, []);
 
+  // 流式期间消息高频更新：瞬时滚动避免 smooth 动画队列堆积卡死主线程；
+  // 非流式（历史恢复/发送瞬间）仍用平滑滚动
+  const isStreaming = messages.some((m) => m.streaming);
   useEffect(() => {
-    chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
+    chatBottomRef.current?.scrollIntoView({ behavior: isStreaming ? "auto" : "smooth" });
+  }, [messages, loading, isStreaming]);
 
   // 历史下拉打开时：点击面板外部或按 Escape 关闭
   useEffect(() => {
@@ -286,6 +318,10 @@ export default function DoubaoEducationalWorkspace() {
    * 并加载该 agent 的历史对话列表（不在窗口中直接恢复）
    */
   const handleSelectAgent = (id: string) => {
+    // 切换智能体：中断可能仍在进行的流式任务
+    streamAbortRef.current?.abort();
+    streamAbortRef.current = null;
+    setLoading(false);
     setSelectedAgentId(id);
     setHistoryOpen(false);
     const agent = agents.find((a) => a.id === id);
@@ -301,6 +337,10 @@ export default function DoubaoEducationalWorkspace() {
 
   /** 当前 agent 下新建对话：旧对话已实时落库，窗口重置为专属欢迎词 */
   const handleNewChat = () => {
+    // 中断可能仍在进行的流式任务，避免旧 token 写入新对话窗口
+    streamAbortRef.current?.abort();
+    streamAbortRef.current = null;
+    setLoading(false);
     setMessages([buildGreetingMessage(agents.find((a) => a.id === selectedAgentId))]);
     setActiveSessionId(null);
     setActiveArtifact(null);
@@ -332,71 +372,144 @@ export default function DoubaoEducationalWorkspace() {
     const text = textToSend || inputValue;
     if (!text.trim() || loading) return;
 
+    const nowTs = Date.now();
     const userMsg: MessageItem = {
-      id: String(Date.now()),
+      id: String(nowTs),
       role: "user",
       content: text,
       timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     };
+    // assistant 占位消息：SSE 期间始终更新同一条消息（同引用），实现打字机效果
+    const assistantId = `stream-${nowTs + 1}`;
+    const assistantMsg: MessageItem = {
+      id: assistantId,
+      role: "assistant",
+      agent_name: currentAgent.name,
+      agent_avatar: currentAgent.avatar,
+      content: "",
+      steps: [],
+      citations: [],
+      streaming: true,
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    };
 
-    setMessages((prev) => [...prev, userMsg]);
+    setMessages((prev) => [...prev, userMsg, assistantMsg]);
     setInputValue("");
     setLoading(true);
 
+    // 局部补丁流式占位消息，避免整体重建消息列表
+    const patchAssistant = (patch: Partial<MessageItem>) => {
+      setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, ...patch } : m)));
+    };
+    let streamedArtifact: any = null;
+
+    // token 缓冲：LLM 分片粒度很细，逐片 setState 会让 ReactMarkdown/KaTeX
+    // 全量重解析数百次而饿死中间帧渲染。按 80ms 节拍批量 flush，兼顾流畅与实时感。
+    let tokenBuffer = "";
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    const flushTokens = () => {
+      flushTimer = null;
+      if (!tokenBuffer) return;
+      const chunk = tokenBuffer;
+      tokenBuffer = "";
+      setMessages((prev) => prev.map((m) =>
+        m.id === assistantId ? { ...m, content: m.content + chunk } : m
+      ));
+    };
+    const clearFlushTimer = () => {
+      if (flushTimer !== null) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+    };
+
+    const abortController = new AbortController();
+    streamAbortRef.current?.abort();
+    streamAbortRef.current = abortController;
+
     try {
-      const result = await runAgentSync(
-        text,
-        selectedAgentId,
-        [activeKbId],
-        currentUser?.id || "u-001",
-        false,
-        activeSessionId || undefined
-      );
-      const traceSummary = result.trace_summary || {};
-
-      const assistantMsg: MessageItem = {
-        id: String(Date.now() + 1),
-        role: "assistant",
-        agent_name: currentAgent.name,
-        agent_avatar: currentAgent.avatar,
-        content: result.output || "生成完成",
-        steps: traceSummary.steps || [],
-        citations: result.citations || [],
-        artifact: result.artifact,
-        plan_dag: result.plan_dag || null,
-        sub_results: result.sub_results || [],
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-      };
-
-      setMessages((prev) => [...prev, assistantMsg]);
-
-      // 绑定历史对话 ID，并记住本 agent 最后停留的会话
-      if (result.conversation_id) {
-        setActiveSessionId(result.conversation_id);
-        localStorage.setItem(`last_session:${selectedAgentId}`, result.conversation_id);
-      }
-
-      if (result.artifact) {
-        setActiveArtifact(result.artifact);
-        setIsCanvasOpen(true);
-      }
-
-      // 刷新当前 agent 历史列表（标题/排序/消息数）
-      loadHistory(selectedAgentId);
-    } catch (err: any) {
-      console.error("Agent run failed:", err);
-      setMessages((prev) => [
-        ...prev,
+      await runAgentStream(
         {
-          id: String(Date.now() + 1),
-          role: "assistant",
-          agent_name: currentAgent.name,
-          agent_avatar: currentAgent.avatar,
-          content: `抱歉，任务执行失败：${err?.message || "网络或配置异常，请检查后台连接或重试。"}`,
-          timestamp: "错误"
+          message: text,
+          agentType: selectedAgentId,
+          kbIds: [activeKbId],
+          userId: currentUser?.id || "u-001",
+          subAgentMode: false,
+          conversationId: activeSessionId,
+          signal: abortController.signal
+        },
+        {
+          onTrace: (payload) => {
+            setMessages((prev) => prev.map((m) =>
+              m.id === assistantId ? { ...m, steps: mergeTraceStep(m.steps || [], payload) } : m
+            ));
+          },
+          onToken: (chunk) => {
+            // 入缓冲，按固定节拍批量追加（同一条消息，ReactMarkdown 增量重渲染）
+            tokenBuffer += chunk;
+            if (flushTimer === null) {
+              flushTimer = setTimeout(flushTokens, 80);
+            }
+          },
+          onArtifact: (artifact) => {
+            streamedArtifact = artifact;
+            patchAssistant({ artifact });
+          },
+          onDone: (payload) => {
+            // 先排空剩余 token，再以 done 权威结果一次性定稿，避免尾部截断
+            clearFlushTimer();
+            flushTokens();
+            const finalArtifact = payload.artifact || streamedArtifact || undefined;
+            patchAssistant({
+              content: payload.output || "生成完成",
+              steps: (payload.trace_summary && payload.trace_summary.steps) || undefined,
+              citations: payload.citations || [],
+              artifact: finalArtifact,
+              plan_dag: payload.plan_dag || null,
+              sub_results: payload.sub_results || [],
+              streaming: false
+            });
+
+            // 绑定后端落库的历史对话 ID
+            if (payload.conversation_id) {
+              setActiveSessionId(payload.conversation_id);
+              localStorage.setItem(`last_session:${selectedAgentId}`, payload.conversation_id);
+            }
+            if (finalArtifact) {
+              setActiveArtifact(finalArtifact);
+              setIsCanvasOpen(true);
+            }
+            // 刷新当前 agent 历史列表（标题/排序/消息数）
+            loadHistory(selectedAgentId);
+          },
+          onError: (message) => {
+            clearFlushTimer();
+            tokenBuffer = "";
+            patchAssistant({
+              content: `抱歉，${message}`,
+              streaming: false
+            });
+            loadHistory(selectedAgentId);
+          }
         }
-      ]);
+      );
+    } catch (err: any) {
+      // 切换/新建对话触发的主动中止：静默处理，不污染新对话
+      if (err?.name === "AbortError") {
+        clearFlushTimer();
+        return;
+      }
+      console.error("Agent stream failed:", err);
+      clearFlushTimer();
+      patchAssistant({
+        content: `抱歉，任务执行失败：${err?.message || "网络或配置异常，请检查后台连接或重试。"}`,
+        streaming: false
+      });
     } finally {
+      clearFlushTimer();
+      if (streamAbortRef.current === abortController) {
+        streamAbortRef.current = null;
+      }
       setLoading(false);
     }
   };
@@ -680,33 +793,43 @@ export default function DoubaoEducationalWorkspace() {
                   </div>
                 )}
 
-                {/* Main Message Content - Markdown + LaTeX 渲染 */}
-                <div className="prose prose-slate prose-sm max-w-none
-                  prose-headings:font-semibold prose-headings:text-slate-800
-                  prose-h1:text-xl prose-h1:mt-4 prose-h1:mb-2 prose-h1:border-b prose-h1:border-slate-200 prose-h1:pb-1
-                  prose-h2:text-lg prose-h2:mt-3 prose-h2:mb-2 prose-h2:text-blue-700
-                  prose-h3:text-base prose-h3:mt-2 prose-h3:mb-1 prose-h3:text-slate-700
-                  prose-p:my-1.5 prose-p:leading-relaxed
-                  prose-ul:my-2 prose-ul:list-disc prose-ul:pl-5
-                  prose-ol:my-2 prose-ol:list-decimal prose-ol:pl-5
-                  prose-li:my-0.5
-                  prose-strong:font-semibold prose-strong:text-slate-900
-                  prose-blockquote:border-l-4 prose-blockquote:border-blue-300 prose-blockquote:bg-blue-50/50 prose-blockquote:py-1 prose-blockquote:pl-3 prose-blockquote:my-2 prose-blockquote:rounded-r
-                  prose-code:text-pink-600 prose-code:bg-pink-50 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-[13px] prose-code:before:content-none prose-code:after:content-none
-                  prose-pre:bg-slate-800 prose-pre:text-slate-100 prose-pre:rounded-lg prose-pre:p-3 prose-pre:overflow-x-auto
-                  prose-table:border-collapse prose-table:my-3 prose-table:w-full
-                  prose-th:border prose-th:border-slate-300 prose-th:bg-slate-100 prose-th:px-3 prose-th:py-1.5 prose-th:text-left prose-th:font-semibold prose-th:text-sm
-                  prose-td:border prose-td:border-slate-300 prose-td:px-3 prose-td:py-1.5 prose-td:text-sm
-                  prose-hr:border-slate-200 prose-hr:my-4
-                  [&_.katex-display]:my-3 [&_.katex-display]:overflow-x-auto [&_.katex]:text-base
-                ">
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm, remarkMath]}
-                    rehypePlugins={[rehypeKatex]}
-                  >
-                    {preprocessMarkdown(msg.content)}
-                  </ReactMarkdown>
-                </div>
+                {/* Main Message Content - 流式思考态 / Markdown + LaTeX 渲染 */}
+                {msg.role === "assistant" && msg.streaming && !msg.content && (!msg.steps || msg.steps.length === 0) ? (
+                  <div className="flex items-center space-x-2 text-xs text-slate-500 py-1">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin text-blue-600" />
+                    <span>正在结合专属教学记忆，协同调用学科专家智能体与 RAG 检索...</span>
+                  </div>
+                ) : (
+                  <div className="prose prose-slate prose-sm max-w-none
+                    prose-headings:font-semibold prose-headings:text-slate-800
+                    prose-h1:text-xl prose-h1:mt-4 prose-h1:mb-2 prose-h1:border-b prose-h1:border-slate-200 prose-h1:pb-1
+                    prose-h2:text-lg prose-h2:mt-3 prose-h2:mb-2 prose-h2:text-blue-700
+                    prose-h3:text-base prose-h3:mt-2 prose-h3:mb-1 prose-h3:text-slate-700
+                    prose-p:my-1.5 prose-p:leading-relaxed
+                    prose-ul:my-2 prose-ul:list-disc prose-ul:pl-5
+                    prose-ol:my-2 prose-ol:list-decimal prose-ol:pl-5
+                    prose-li:my-0.5
+                    prose-strong:font-semibold prose-strong:text-slate-900
+                    prose-blockquote:border-l-4 prose-blockquote:border-blue-300 prose-blockquote:bg-blue-50/50 prose-blockquote:py-1 prose-blockquote:pl-3 prose-blockquote:my-2 prose-blockquote:rounded-r
+                    prose-code:text-pink-600 prose-code:bg-pink-50 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-[13px] prose-code:before:content-none prose-code:after:content-none
+                    prose-pre:bg-slate-800 prose-pre:text-slate-100 prose-pre:rounded-lg prose-pre:p-3 prose-pre:overflow-x-auto
+                    prose-table:border-collapse prose-table:my-3 prose-table:w-full
+                    prose-th:border prose-th:border-slate-300 prose-th:bg-slate-100 prose-th:px-3 prose-th:py-1.5 prose-th:text-left prose-th:font-semibold prose-th:text-sm
+                    prose-td:border prose-td:border-slate-300 prose-td:px-3 prose-td:py-1.5 prose-td:text-sm
+                    prose-hr:border-slate-200 prose-hr:my-4
+                    [&_.katex-display]:my-3 [&_.katex-display]:overflow-x-auto [&_.katex]:text-base
+                  ">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm, remarkMath]}
+                      rehypePlugins={[rehypeKatex]}
+                    >
+                      {preprocessMarkdown(msg.content)}
+                    </ReactMarkdown>
+                    {msg.streaming && (
+                      <span className="inline-block w-[3px] h-4 ml-1 align-middle bg-blue-500 animate-pulse rounded-sm" />
+                    )}
+                  </div>
+                )}
 
                 {/* Citations Preview */}
                 {msg.citations && msg.citations.length > 0 && (
@@ -743,18 +866,7 @@ export default function DoubaoEducationalWorkspace() {
             </div>
           ))}
 
-          {/* Loading Indicator */}
-          {loading && (
-            <div className="flex items-start space-x-3">
-              <div className="w-9 h-9 rounded-2xl bg-white border border-slate-200/80 shadow-xs flex items-center justify-center text-lg shrink-0 animate-pulse">
-                {currentAgent.avatar}
-              </div>
-              <div className="bg-white border border-slate-200/80 rounded-[22px] rounded-bl-[4px] px-5 py-3.5 shadow-sm text-xs text-slate-500 flex items-center space-x-2.5">
-                <RefreshCw className="w-4 h-4 animate-spin text-blue-600" />
-                <span>正在结合您的专属教学记忆，协同调用学科专家智能体与 RAG 检索...</span>
-              </div>
-            </div>
-          )}
+          {/* Loading Indicator：流式期间由 assistant 占位气泡内的思考态/打字光标承载，此处不再重复渲染 */}
 
           <div ref={chatBottomRef} />
         </div>

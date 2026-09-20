@@ -14,6 +14,7 @@ from app.services.agent.specialized.rubric_grading import rubric_grading_agent
 from app.services.agent.specialized.slide_outline import slide_outline_agent
 from app.services.agent.specialized.code_grader import code_grader_agent
 from app.services.agent.checkpointer import session_checkpointer
+from app.services.agent.stream_compensate import TokenCounter
 from app.harness.base import AgentHarness
 from app.harness.fingerprint import dispose_fingerprint_guard
 
@@ -275,10 +276,13 @@ class MultiAgentGraphEngine:
                 "payload": {"text": chunk, "agent": agent_target}
             })
 
+        # 计数器区分真实流式 token 与一次性返回：非流式 agent 执行后补发打字机分片
+        token_counter = TokenCounter(_on_token)
         agent_result = await cls._dispatch_agent(
-            agent_target, state, on_token=_on_token
+            agent_target, state, on_token=token_counter
         )
         state.update(agent_result)
+        await token_counter.compensate_if_silent(state.get("final_markdown_output", ""))
         harness.finish_step(step_id, detail="专业领域生成完成")
         await _emit({
             "event_type": "trace",

@@ -139,7 +139,8 @@ async def run_agent_async(payload: AgentRunRequest, background_tasks: Background
         user_message=user_message,
     )
 
-    # 2. 投递到执行队列
+    # 2. 投递到执行队列（conversation_id 在执行器开场绑定：沿用传入会话或新建，
+    #    会话创建与用户消息落库由执行器完成，避免连击 duplicate 时产生空垃圾会话）
     submit_result = await task_manager.submit_task(
         task_id=task_id,
         user_message=user_message,
@@ -149,6 +150,7 @@ async def run_agent_async(payload: AgentRunRequest, background_tasks: Background
         user_role="teacher",
         agent_type=agent_type,
         kb_ids=payload.kb_ids,
+        conversation_id=payload.conversation_id,
     )
 
     dispatcher = submit_result.get("dispatcher")
@@ -161,6 +163,7 @@ async def run_agent_async(payload: AgentRunRequest, background_tasks: Background
             user_id=user_id,
             user_role="teacher",
             kb_ids=payload.kb_ids,
+            conversation_id=payload.conversation_id,
         )
     elif dispatcher == "duplicate":
         # 幂等拦截
