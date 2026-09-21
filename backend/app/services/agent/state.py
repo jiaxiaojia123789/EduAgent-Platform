@@ -47,3 +47,11 @@ class AgentState(TypedDict):
     # Error handling & Recovery
     retry_count: int
     error_message: Optional[str]
+
+    # ---- LangGraph 运行时字段 ----
+    quality_score: float                      # QualityReview 综合打分 [0,1]
+    needs_revision: bool                      # 是否需要返工
+    revision_history: Annotated[List[str], operator.add]  # 每次返工的问题描述（追加）
+    sub_results: Annotated[List[Dict[str, Any]], operator.add]  # 并行 sub-agent 结果（Map-Reduce，追加合并）
+    plan_dag: Optional[Dict[str, Any]]        # Orchestrator 拆解的 DAG
+    human_decision: Optional[Dict[str, Any]]  # HITL 恢复时注入的教师决策 {approved, comments}
