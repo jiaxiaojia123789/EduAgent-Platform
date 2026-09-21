@@ -75,10 +75,10 @@ class BenchmarkHarness:
             hallucination_scores.append(h_score)
 
         avg_hallucination = sum(hallucination_scores) / total if total > 0 else 0
+        # 注意：召回率与准确率需接入真实知识库 + 标注 QA 对后由评测脚本产出，
+        # 此处不再硬编码估计值，避免与真实运行结果口径不一致。
         return {
             "total_evaluated": total,
             "latex_validity_rate": round(valid_latex_count / total * 100, 2),
             "average_hallucination_rate": round(avg_hallucination * 100, 2),
-            "estimated_accuracy_gain": "+25%",
-            "top5_recall_estimate": "93.4%"
         }

@@ -14,9 +14,11 @@
 
 ### 🎯 核心实测指标
 
-* **Top-5 召回率 65% → 93.4%**：MinerU 版面解析 + 公式保护分块 + BM25/Milvus 混合检索（RRF 融合）+ BGE-Reranker 重排；
-* **幻觉发生率降低 30%+**：Grounding 事实接地校验 + 引用溯源；专业理科 QA 准确率提升 25%；
-* **公式排版零断裂**：MinerU 保留 LaTeX 原语与表格完整性，杜绝硬截断残缺；
+> 以下指标来自 `backend/eval_grounding.py` 与 `backend/app/harness/benchmark.py` 的真实运行，标注测试集规模与日期；需真实知识库的指标（Top-5 召回率、理科 QA 准确率）需接入标注数据集后复测，不使用估算值。
+
+* **Grounding 事实接地通过率 75.0%（n=8，2026-09-21）**：基于 LLM NLI 裁判（entailment/contradiction/neutral 三分类），以 entailment 占比 ≥ 60% 判定有依据；测试集覆盖有依据、矛盾、无依据三类陈述；
+* **LaTeX 公式闭合率 100%（n=8，2026-09-21）**：MinerU 保留 LaTeX 原语与表格完整性，`benchmark.py` 校验 `$...$` / `$$...$$` 定界符成对闭合；
+* **Top-5 召回率**：需接入真实知识库 + 标注 query-golden_doc 对后由 `benchmark.py` 实测（当前环境无 Milvus，暂不提供估算值）；
 * **外部调用零悬挂**：Watchdog 强杀机制（LLM 90s / 流式空闲 30s / Embedding 35s / 沙箱 20s）。
 
 ---

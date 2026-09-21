@@ -67,7 +67,7 @@ class AcademicRAGAgent(SubAgent):
 
         # 4. Extract citations and check grounding
         citations = hallucination_checker.extract_citations(answer, reranked_docs)
-        is_grounded, g_score, g_status = hallucination_checker.verify_grounding(answer, reranked_docs)
+        is_grounded, g_score, g_status = await hallucination_checker.verify_grounding(answer, reranked_docs)
 
         logger.info(f"[AcademicRAG] Completed RAG synthesis. Citations: {len(citations)}, Grounding: {g_score}")
 
