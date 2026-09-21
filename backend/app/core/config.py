@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     MINERU_API_BASE: str = "https://mineru.net/api/v4"
     MINERU_MODEL_VERSION: str = "vlm"               # vlm 模式（视觉语言模型）
 
+    # BGE Cross-Encoder Reranker
+    # 真 BGE 重排：默认 BAAI/bge-reranker-base（~278MB，中英文，CPU 可跑）
+    # 若需更强多语言可改 BAAI/bge-reranker-v2-m3（~568MB）
+    # 国内下载模型需设环境变量 HF_ENDPOINT=https://hf-mirror.com
+    RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-base"
+    RERANKER_ENABLE_BGE: bool = True        # 关闭则直接走启发式降级
+    RERANKER_BATCH_SIZE: int = 32           # CrossEncoder 批量推理批大小
+    RERANKER_CACHE_DIR: Optional[str] = None  # None=使用 HF 默认缓存（~/.cache/huggingface）
+
     # Milvus 2.4 Vector DB
     MILVUS_HOST: str = "localhost"
     MILVUS_PORT: int = 19530
