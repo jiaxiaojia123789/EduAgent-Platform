@@ -55,3 +55,6 @@ class AgentState(TypedDict):
     sub_results: Annotated[List[Dict[str, Any]], operator.add]  # 并行 sub-agent 结果（Map-Reduce，追加合并）
     plan_dag: Optional[Dict[str, Any]]        # Orchestrator 拆解的 DAG
     human_decision: Optional[Dict[str, Any]]  # HITL 恢复时注入的教师决策 {approved, comments}
+    sub_agent_mode: bool                      # 是否强制 Orchestrator 多 sub-agent 协作
+    hitl_auto_approve: bool                   # True 时跳过 HITL 暂停（同步链路兼容旧行为）
+    raw_user_message: str                     # 脱敏后的用户原文（未挂记忆 prompt），供意图拆解使用

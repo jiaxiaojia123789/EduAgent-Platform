@@ -66,6 +66,7 @@ class TaskManager:
         agent_type: str = "supervisor",
         kb_ids: Optional[list] = None,
         conversation_id: Optional[str] = None,
+        sub_agent_mode: bool = False,
     ) -> Dict[str, Any]:
         """
         提交任务到执行队列
@@ -79,7 +80,7 @@ class TaskManager:
         if not acquired:
             # 检查是否已有同 thread 任务
             existing = await redis_task_store.get_task(task_id)
-            if existing and existing.get("status") in ("PENDING", "RUNNING"):
+            if existing and existing.get("status") in ("PENDING", "RUNNING", "WAITING_APPROVAL"):
                 return {
                     "dispatcher": "duplicate",
                     "task_id": task_id,
@@ -101,6 +102,7 @@ class TaskManager:
                         "agent_type": agent_type,
                         "kb_ids": kb_ids,
                         "conversation_id": conversation_id,
+                        "sub_agent_mode": sub_agent_mode,
                     },
                     queue="agent_heavy",
                 )
@@ -127,6 +129,7 @@ class TaskManager:
         user_role: str = "teacher",
         kb_ids: Optional[list] = None,
         conversation_id: Optional[str] = None,
+        sub_agent_mode: bool = False,
     ):
         """
         进程内 fallback 执行器
@@ -140,7 +143,7 @@ class TaskManager:
         await redis_task_store.update_status(task_id, "RUNNING", current_node="Supervisor")
 
         try:
-            from app.services.agent.graph import graph_engine
+            from app.services.agent.teaching_graph import teaching_graph_runner
             from app.harness.base import AgentHarness
             from app.core.celery_app import publish_task_event
             from app.services.task_queue.result_persistence import (
@@ -155,7 +158,7 @@ class TaskManager:
             harness = AgentHarness(session_id=task["session_id"], user_role=user_role)
 
             async def event_callback(event: Dict[str, Any]):
-                # 覆盖 task_id（graph_engine 内部用 session_id 占位）
+                # 覆盖 task_id（节点内部用 session_id 占位）
                 event["task_id"] = task_id
                 await publish_task_event(task_id, event)
 
@@ -171,7 +174,7 @@ class TaskManager:
             )
             persist_user_message(conversation_id, user_message)
 
-            result = await graph_engine.run_workflow(
+            result = await teaching_graph_runner.run_workflow(
                 user_message=user_message,
                 session_id=task["session_id"],
                 thread_id=task["thread_id"],
@@ -181,48 +184,136 @@ class TaskManager:
                 kb_ids=kb_ids,
                 harness=harness,
                 event_callback=event_callback,
+                sub_agent_mode=sub_agent_mode,
+                task_id=task_id,
+                conversation_id=conversation_id,
             )
 
-            await redis_task_store.complete_task(task_id, result)
-            # assistant 结果补写历史对话库（与 /sync-run 契约一致）
-            persist_task_result(conversation_id, result)
-
-            # 推送结束事件
-            if result.get("artifact"):
-                await publish_task_event(task_id, {
-                    "event_type": "artifact",
-                    "task_id": task_id,
-                    "payload": result["artifact"]
-                })
-            await publish_task_event(task_id, {
-                "event_type": "done",
-                "task_id": task_id,
-                "payload": build_done_payload(conversation_id, result)
-            })
-
-        except Exception as e:
-            logger.exception(f"[TaskManager] Fallback 执行失败 task={task_id}")
-            await redis_task_store.fail_task(task_id, str(e))
-            try:
-                from app.core.celery_app import publish_task_event
-                from app.services.task_queue.result_persistence import (
-                    friendly_error_message,
-                    persist_task_failure,
+            # ---- HITL 暂停：不落 assistant、不发 done，等待教师审批 ----
+            if result.get("run_status") == "waiting_approval":
+                await redis_task_store.update_status(
+                    task_id, "WAITING_APPROVAL", current_node="HITL_Gate"
                 )
-                agent_type = (task or {}).get("agent_type", "supervisor")
-                persist_task_failure(conversation_id, str(e), agent_type)
                 await publish_task_event(task_id, {
-                    "event_type": "error",
+                    "event_type": "approval_required",
                     "task_id": task_id,
                     "payload": {
-                        "error": friendly_error_message(str(e)),
-                        "raw_error": str(e)[:500],
-                        "conversation_id": conversation_id,
                         "task_id": task_id,
-                    }
+                        "conversation_id": conversation_id,
+                        "output": result.get("output", ""),
+                        "quality_score": result.get("quality_score", 0.0),
+                        "artifact": result.get("artifact"),
+                    },
                 })
-            except Exception:
-                logger.exception(f"[TaskManager] 失败事件发布失败 task={task_id}")
+                logger.info(f"[TaskManager] 任务 {task_id} 已暂停，等待教师审批")
+                return
+
+            await self._finalize_success(task_id, conversation_id, result)
+
+        except Exception as e:
+            await self._finalize_failure(task_id, task, conversation_id, e)
+
+    async def resume_task(
+        self,
+        task_id: str,
+        approved: bool,
+        comments: Optional[str] = None,
+    ):
+        """
+        HITL 审批恢复（fallback/同进程模式）：
+        从 teaching_graph_runner 的暂停注册表续跑，终态后复用同一套落库/推流收尾逻辑。
+        """
+        from app.services.agent.teaching_graph import teaching_graph_runner
+        from app.core.celery_app import publish_task_event
+
+        task = await redis_task_store.get_task(task_id)
+        if not task:
+            return
+        paused = teaching_graph_runner.get_paused_run(task_id)
+        conversation_id = paused.conversation_id if paused else None
+
+        async def event_callback(event: Dict[str, Any]):
+            event["task_id"] = task_id
+            await publish_task_event(task_id, event)
+
+        await redis_task_store.update_status(task_id, "RUNNING", current_node="HITL_Gate")
+        try:
+            result = await teaching_graph_runner.resume(
+                task_id=task_id,
+                approved=approved,
+                comments=comments,
+                event_callback=event_callback,
+            )
+
+            # 被驳回返工后再次进入审批：继续保持暂停态
+            if result.get("run_status") == "waiting_approval":
+                await redis_task_store.update_status(
+                    task_id, "WAITING_APPROVAL", current_node="HITL_Gate"
+                )
+                await publish_task_event(task_id, {
+                    "event_type": "approval_required",
+                    "task_id": task_id,
+                    "payload": {
+                        "task_id": task_id,
+                        "conversation_id": conversation_id,
+                        "output": result.get("output", ""),
+                        "quality_score": result.get("quality_score", 0.0),
+                        "artifact": result.get("artifact"),
+                    },
+                })
+                return
+
+            await self._finalize_success(task_id, conversation_id, result)
+        except Exception as e:
+            await self._finalize_failure(task_id, task, conversation_id, e)
+
+    async def _finalize_success(self, task_id: str, conversation_id, result: Dict[str, Any]):
+        """任务终态收尾：Redis 完成态 + assistant 落库 + artifact/done 事件"""
+        from app.core.celery_app import publish_task_event
+        from app.services.task_queue.result_persistence import (
+            build_done_payload,
+            persist_task_result,
+        )
+
+        await redis_task_store.complete_task(task_id, result)
+        persist_task_result(conversation_id, result)
+
+        if result.get("artifact"):
+            await publish_task_event(task_id, {
+                "event_type": "artifact",
+                "task_id": task_id,
+                "payload": result["artifact"]
+            })
+        await publish_task_event(task_id, {
+            "event_type": "done",
+            "task_id": task_id,
+            "payload": build_done_payload(conversation_id, result)
+        })
+
+    async def _finalize_failure(self, task_id: str, task: dict, conversation_id, exc: Exception):
+        """任务异常收尾：Redis 失败态 + 错误消息落库 + error 事件"""
+        logger.exception(f"[TaskManager] 执行失败 task={task_id}: {exc}")
+        await redis_task_store.fail_task(task_id, str(exc))
+        try:
+            from app.core.celery_app import publish_task_event
+            from app.services.task_queue.result_persistence import (
+                friendly_error_message,
+                persist_task_failure,
+            )
+            agent_type = (task or {}).get("agent_type", "supervisor")
+            persist_task_failure(conversation_id, str(exc), agent_type)
+            await publish_task_event(task_id, {
+                "event_type": "error",
+                "task_id": task_id,
+                "payload": {
+                    "error": friendly_error_message(str(exc)),
+                    "raw_error": str(exc)[:500],
+                    "conversation_id": conversation_id,
+                    "task_id": task_id,
+                }
+            })
+        except Exception:
+            logger.exception(f"[TaskManager] 失败事件发布失败 task={task_id}")
 
     async def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
         """从 Redis 读取任务状态"""

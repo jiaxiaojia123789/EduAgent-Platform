@@ -111,6 +111,7 @@ if _HAS_CELERY:
         agent_type: str = "supervisor",
         kb_ids: Optional[List[str]] = None,
         conversation_id: Optional[str] = None,
+        sub_agent_mode: bool = False,
     ) -> Dict[str, Any]:
         """
         Celery 任务：执行 Agent 多智能体工作流
@@ -132,6 +133,7 @@ if _HAS_CELERY:
                     agent_type=agent_type,
                     kb_ids=kb_ids,
                     conversation_id=conversation_id,
+                    sub_agent_mode=sub_agent_mode,
                 )
             )
             return result
@@ -158,9 +160,10 @@ if _HAS_CELERY:
         agent_type: str,
         kb_ids: Optional[List[str]],
         conversation_id: Optional[str] = None,
+        sub_agent_mode: bool = False,
     ) -> Dict[str, Any]:
         # 延迟导入避免循环依赖
-        from app.services.agent.graph import graph_engine
+        from app.services.agent.teaching_graph import teaching_graph_runner
         from app.harness.base import AgentHarness
         from app.services.task_queue.redis_task_store import redis_task_store
         from app.services.task_queue.result_persistence import (
@@ -188,7 +191,7 @@ if _HAS_CELERY:
         persist_user_message(conversation_id, user_message)
 
         try:
-            result = await graph_engine.run_workflow(
+            result = await teaching_graph_runner.run_workflow(
                 user_message=user_message,
                 session_id=session_id,
                 thread_id=thread_id,
@@ -198,7 +201,30 @@ if _HAS_CELERY:
                 kb_ids=kb_ids,
                 harness=harness,
                 event_callback=event_callback,
+                sub_agent_mode=sub_agent_mode,
+                task_id=task_id,
+                conversation_id=conversation_id,
             )
+
+            # ---- HITL 暂停：不落 assistant、不发 done，等待教师审批 ----
+            if result.get("run_status") == "waiting_approval":
+                await redis_task_store.update_status(
+                    task_id, "WAITING_APPROVAL", current_node="HITL_Gate"
+                )
+                await _publish_event(task_id, {
+                    "event_type": "approval_required",
+                    "task_id": task_id,
+                    "payload": {
+                        "task_id": task_id,
+                        "conversation_id": conversation_id,
+                        "output": result.get("output", ""),
+                        "quality_score": result.get("quality_score", 0.0),
+                        "artifact": result.get("artifact"),
+                    },
+                })
+                logger.info(f"[Celery Task {task_id}] 已暂停，等待教师审批")
+                return result
+
             # 写回 Redis
             await redis_task_store.complete_task(task_id, result)
             # assistant 结果补写历史对话库（与 /sync-run 契约一致）

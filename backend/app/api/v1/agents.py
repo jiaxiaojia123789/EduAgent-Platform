@@ -1,12 +1,20 @@
 import uuid
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import Optional
 from app.schemas.agent import AgentRunRequest, AgentTaskStatus
 from app.services.task_queue.task_manager import task_manager
-from app.services.agent.graph import graph_engine
+from app.services.agent.teaching_graph import teaching_graph_runner
 from app.services.chat.conversation_storage import conversation_storage
 
 router = APIRouter(prefix="/agents", tags=["Agent Workflow Engine"])
+
+
+class HITLDecisionBody(BaseModel):
+    """教师对 HITL 暂停任务的审批决策（task_id 走路径参数）"""
+    approved: bool
+    comments: Optional[str] = None
 
 EDUCATION_AGENT_MATRIX = [
     {
@@ -151,6 +159,7 @@ async def run_agent_async(payload: AgentRunRequest, background_tasks: Background
         agent_type=agent_type,
         kb_ids=payload.kb_ids,
         conversation_id=payload.conversation_id,
+        sub_agent_mode=payload.sub_agent_mode,
     )
 
     dispatcher = submit_result.get("dispatcher")
@@ -164,6 +173,7 @@ async def run_agent_async(payload: AgentRunRequest, background_tasks: Background
             user_role="teacher",
             kb_ids=payload.kb_ids,
             conversation_id=payload.conversation_id,
+            sub_agent_mode=payload.sub_agent_mode,
         )
     elif dispatcher == "duplicate":
         # 幂等拦截
@@ -232,7 +242,7 @@ async def run_agent_sync(payload: AgentRunRequest):
     )
 
     try:
-        result = await graph_engine.run_workflow(
+        result = await teaching_graph_runner.run_workflow(
             user_message=payload.message,
             session_id=session_id,
             thread_id=thread_id,
@@ -240,6 +250,7 @@ async def run_agent_sync(payload: AgentRunRequest):
             explicit_agent=payload.agent_type,
             kb_ids=payload.kb_ids,
             sub_agent_mode=payload.sub_agent_mode,
+            auto_approve=True,  # 同步链路保持旧行为：不中断等待审批
         )
     except HTTPException:
         raise
@@ -287,6 +298,45 @@ async def get_task_status(task_id: str):
     if not status:
         raise HTTPException(status_code=404, detail="Task not found")
     return status
+
+
+@router.post("/tasks/{task_id}/approval")
+async def review_task(task_id: str, body: HITLDecisionBody, background_tasks: BackgroundTasks):
+    """
+    教师对 HITL 暂停任务提交审批决策。
+    - approved=true：图从 hitl_gate 续跑到 END，随后正常推 artifact/done 事件
+    - approved=false：带教师意见进入 revision 返工，返工后可再次审批
+    续跑结果仍通过原 SSE 通道（/tasks/{task_id}/stream）推送，前端保持订阅即可。
+    """
+    status = await task_manager.get_task_status(task_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if status.get("status") != "WAITING_APPROVAL":
+        raise HTTPException(
+            status_code=409,
+            detail=f"任务当前状态为 {status.get('status')}，无需审批（仅 WAITING_APPROVAL 可审批）",
+        )
+
+    # 暂停态保存在执行进程内存中：fallback（同进程）可恢复；
+    # Celery 跨进程恢复需 RedisSaver 持久化（P1），当前明确返回 503
+    if not teaching_graph_runner.get_paused_run(task_id):
+        raise HTTPException(
+            status_code=503,
+            detail="暂停态不在当前进程（Celery worker 跨进程恢复需 RedisSaver 持久化），请在同进程部署模式下使用审批",
+        )
+
+    background_tasks.add_task(
+        task_manager.resume_task,
+        task_id,
+        body.approved,
+        body.comments,
+    )
+    return {
+        "task_id": task_id,
+        "status": "RESUMING",
+        "approved": body.approved,
+        "stream_url": f"/api/v1/agents/tasks/{task_id}/stream",
+    }
 
 
 @router.get("/tasks/{task_id}/stream")
