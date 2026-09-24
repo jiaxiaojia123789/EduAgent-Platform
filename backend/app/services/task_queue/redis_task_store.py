@@ -46,6 +46,19 @@ class RedisTaskStore:
     def _steps_key(self, task_id: str) -> str:
         return f"{TASK_KEY_PREFIX}:{task_id}:steps"
 
+    def _conv_link_key(self, task_id: str) -> str:
+        return f"{TASK_KEY_PREFIX}:{task_id}:conversation"
+
+    async def set_conversation_link(self, task_id: str, conversation_id: Optional[str]) -> None:
+        """任务暂停时记录绑定的 conversation_id，供跨进程 HITL 恢复时找回。"""
+        await redis_manager.set(
+            self._conv_link_key(task_id), conversation_id or "", ex=TASK_TTL_SECONDS
+        )
+
+    async def get_conversation_link(self, task_id: str) -> Optional[str]:
+        value = await redis_manager.get(self._conv_link_key(task_id))
+        return value or None
+
     async def create_task(
         self,
         session_id: str,

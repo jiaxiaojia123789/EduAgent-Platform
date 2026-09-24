@@ -11,7 +11,7 @@ bcrypt==4.2.0
 sqlalchemy==2.0.35
 asyncpg==0.29.0
 alembic==1.13.3
-redis==5.1.1                # 用于：异步任务 broker / 幂等锁 / SSE Pub/Sub / LangGraph 持久化 checkpointer
+redis==8.1.0                # 用于：异步任务 broker / 幂等锁 / SSE Pub/Sub / LangGraph RedisSaver
 celery==5.4.0              # 用于：企业级分布式任务队列，独立 worker 进程消费长任务
 eventlet==0.37.0           # 用于：Windows 下 Celery worker 的并发池（替代 gevent，-P eventlet）
 flower==2.0.0              # 用于：Celery 任务可视化监控面板（默认 http://localhost:5555）
@@ -19,16 +19,19 @@ flower==2.0.0              # 用于：Celery 任务可视化监控面板（默�
 # Vector Database & Retrieval
 pymilvus==2.4.6
 rank_bm25==0.2.2
-numpy==1.26.4
+numpy>=1.26.4,<3            # Python 3.14 需 numpy 2.x；3.10-3.12 可用 1.26.x
 sentence-transformers>=3.0.0     # BGE Cross-Encoder Reranker（自动依赖 torch+transformers）
 
 # LLM, Agent & Orchestration
+# LangGraph 1.x：原生 interrupt()/Command(resume=) HITL 语义，稳定执行模型
+# 版本矩阵经 pip 解析对齐：langgraph 1.2.11 ↔ langgraph-checkpoint 4.2 ↔ redis saver 0.5.2
 dashscope==1.20.10
 openai==1.51.0
-langchain==0.3.1
-langchain-core==0.3.6
-langchain-community==0.3.1
-langgraph==0.2.34
+langchain==1.4.2
+langchain-core==1.6.3
+langchain-community==0.4.2
+langgraph==1.2.11
+langgraph-checkpoint-redis==0.5.2  # Redis 持久化 checkpointer（需 Redis 8+ 或 Redis Stack）
 langfuse==2.50.0           # 用于：trace/span 观测推送到 Langfuse 云端
 
 # Document & Content Processing

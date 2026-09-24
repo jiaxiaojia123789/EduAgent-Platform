@@ -300,6 +300,46 @@ async def get_task_status(task_id: str):
     return status
 
 
+@router.get("/graph/visualization")
+async def get_graph_visualization(format: str = "mermaid"):
+    """
+    教学图结构可视化：
+    - mermaid（默认）：Mermaid.js 源码，前端可直接渲染
+    - ascii：终端 ASCII 图
+    - png：经 mermaid.ink 渲染 PNG（需出网；不可达返回 503）
+    """
+    from app.services.agent.teaching_graph import get_teaching_graph
+
+    graph = await get_teaching_graph()
+    drawn = graph.get_graph()
+    fmt = format.lower()
+
+    if fmt == "mermaid":
+        return {"format": "mermaid", "diagram": drawn.draw_mermaid()}
+    if fmt == "ascii":
+        return {"format": "ascii", "diagram": drawn.draw_text()}
+    if fmt == "png":
+        import base64
+        import httpx
+        from fastapi import Response
+
+        encoded = base64.urlsafe_b64encode(
+            drawn.draw_mermaid().encode("utf-8")
+        ).decode()
+        url = f"https://mermaid.ink/img/{encoded}?type=png"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+        except Exception as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"PNG 渲染失败（mermaid.ink 不可达）：{e}",
+            )
+        return Response(content=resp.content, media_type="image/png")
+    raise HTTPException(status_code=400, detail="format 仅支持 mermaid / ascii / png")
+
+
 @router.post("/tasks/{task_id}/approval")
 async def review_task(task_id: str, body: HITLDecisionBody, background_tasks: BackgroundTasks):
     """
@@ -317,13 +357,18 @@ async def review_task(task_id: str, body: HITLDecisionBody, background_tasks: Ba
             detail=f"任务当前状态为 {status.get('status')}，无需审批（仅 WAITING_APPROVAL 可审批）",
         )
 
-    # 暂停态保存在执行进程内存中：fallback（同进程）可恢复；
-    # Celery 跨进程恢复需 RedisSaver 持久化（P1），当前明确返回 503
+    # 恢复路径：
+    # - 暂停态在本进程注册表：直接恢复
+    # - checkpointer 为 RedisSaver：跨进程从 checkpoint 恢复（Celery worker 重启/异机均可）
+    # - MemorySaver 且本地无暂停态：无法恢复，明确返回 503
+    from app.services.agent.teaching_graph import checkpointer_backend
+
     if not teaching_graph_runner.get_paused_run(task_id):
-        raise HTTPException(
-            status_code=503,
-            detail="暂停态不在当前进程（Celery worker 跨进程恢复需 RedisSaver 持久化），请在同进程部署模式下使用审批",
-        )
+        if checkpointer_backend() != "redis":
+            raise HTTPException(
+                status_code=503,
+                detail="暂停态不在当前进程且 checkpointer 非 RedisSaver，无法跨进程恢复",
+            )
 
     background_tasks.add_task(
         task_manager.resume_task,

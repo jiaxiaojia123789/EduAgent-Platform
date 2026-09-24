@@ -194,6 +194,7 @@ class TaskManager:
                 await redis_task_store.update_status(
                     task_id, "WAITING_APPROVAL", current_node="HITL_Gate"
                 )
+                await redis_task_store.set_conversation_link(task_id, conversation_id)
                 await publish_task_event(task_id, {
                     "event_type": "approval_required",
                     "task_id": task_id,

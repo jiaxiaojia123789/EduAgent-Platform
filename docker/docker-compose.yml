@@ -86,7 +86,7 @@ services:
 
   redis:
     container_name: edu-redis
-    image: redis:7-alpine
+    image: redis:8-alpine      # Redis 8+ 内置 RedisJSON/RediSearch，供 LangGraph RedisSaver 使用
     restart: always
     ports:
       - "6379:6379"

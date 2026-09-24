@@ -1,5 +1,5 @@
 """
-LangGraph 教学智能体执行图（真 LangGraph StateGraph 实现）
+LangGraph 教学智能体执行图（真 LangGraph StateGraph 实现，LangGraph 1.x）
 
 拓扑：
   intent_router ──conditional──► [9 个专业 agent] ──► aggregate ──► quality_review
@@ -8,7 +8,7 @@ LangGraph 教学智能体执行图（真 LangGraph StateGraph 实现）
                                           ┌──────────────────────────┼──────────────┐
                                          yes            no(需审批)                 no(免审批)
                                           ▼               ▼                           ▼
-                                      revision        hitl_gate(interrupt)        approved → END
+                                      revision      hitl_gate(interrupt)         approved → END
                                           │               │ approved?
                                           └─►quality_review├─yes──► END
                                             (≤2 次)        └─no───► revision
@@ -16,9 +16,11 @@ LangGraph 教学智能体执行图（真 LangGraph StateGraph 实现）
 能力：
 - 真 token 流：节点经 config 注入 on_token，优先 execute_stream，非流式 agent 用 TokenCounter 补偿
 - 复合任务：route_by_intent 返回 Send 列表并行执行，aggregate 节点合并写回 final_markdown_output
-- HITL：compile(interrupt_before=["hitl_gate"]) 暂停，TeachingGraphRunner.resume 注入决策续跑
-- trace：节点开始/结束事件经 config.on_event 推到既有 SSE 事件总线
+- HITL：原生 interrupt() 暂停，TeachingGraphRunner.resume 以 Command(resume=) 注入决策续跑
+- 持久化：AsyncRedisSaver（Redis 8+ / Redis Stack），不可用时降级 MemorySaver；支持跨进程恢复
+- 可观测性：全节点 node_start/node_end 事件（耗时/retry_count/quality_score），汇总入 trace_summary
 """
+import asyncio
 import inspect
 import logging
 import time
@@ -26,10 +28,11 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Callable, Awaitable
 
 from langgraph.graph import StateGraph, END
-from langgraph.types import Send
+from langgraph.types import Send, Command, interrupt
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
 
+from app.core.config import settings
 from app.services.agent.state import AgentState
 from app.services.agent.supervisor import supervisor_agent
 from app.services.agent.sub_agent import SubAgentRegistry
@@ -51,6 +54,101 @@ MAX_REVISION = 2
 
 # 事件回调类型
 EventCallback = Callable[[Dict[str, Any]], Awaitable[None]]
+
+
+# ============================================================
+# Checkpointer 工厂：AsyncRedisSaver（持久化）→ MemorySaver（降级）
+# ============================================================
+
+_checkpointer: Optional[Any] = None
+_checkpointer_backend: str = "memory"
+_checkpointer_init_lock = asyncio.Lock()
+
+_graph: Optional[Any] = None
+_graph_init_lock = asyncio.Lock()
+
+
+def _redis_url() -> str:
+    pwd = f":{settings.REDIS_PASSWORD}@" if settings.REDIS_PASSWORD else ""
+    return (
+        f"redis://{pwd}{settings.REDIS_HOST}:{settings.REDIS_PORT}"
+        f"/{settings.REDIS_DB}"
+    )
+
+
+async def _build_redis_saver():
+    """
+    构建 AsyncRedisSaver：
+    1. 探测 Redis 模块（RedisJSON / search）——Redis 8+ 内置，低版本需 Redis Stack
+    2. 独立字节协议连接（decode_responses=False），避免与 redis_manager 的文本连接冲突
+    失败返回 None，由调用方降级 MemorySaver。
+    """
+    from app.core.redis_client import redis_manager
+
+    if not (redis_manager.is_connected and redis_manager.client):
+        return None
+    try:
+        modules = await redis_manager.client.module_list()
+        names = set()
+        for m in modules or []:
+            # decode_responses=True → 字符串键
+            names.add(m.get("name") if isinstance(m, dict) else None)
+        missing = {"ReJSON", "search"} - names
+        if missing:
+            logger.warning(
+                f"[TeachingGraph] Redis 缺少模块 {missing}（需 Redis 8+ 或 Redis Stack），"
+                "checkpointer 降级 MemorySaver"
+            )
+            return None
+
+        import redis.asyncio as aioredis
+        client = aioredis.Redis.from_url(_redis_url(), decode_responses=False)
+        await client.ping()
+
+        from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+        saver = AsyncRedisSaver(redis_client=client)
+        await saver.asetup()  # 幂等创建索引，已存在则跳过
+        return saver
+    except Exception as e:
+        logger.warning(f"[TeachingGraph] AsyncRedisSaver 初始化失败，降级 MemorySaver: {e}")
+        return None
+
+
+async def get_checkpointer() -> Any:
+    """幂等单例：返回 LangGraph checkpointer（RedisSaver / MemorySaver）。"""
+    global _checkpointer, _checkpointer_backend
+    if _checkpointer is not None:
+        return _checkpointer
+    async with _checkpointer_init_lock:
+        if _checkpointer is not None:
+            return _checkpointer
+        saver = await _build_redis_saver()
+        if saver is not None:
+            _checkpointer = saver
+            _checkpointer_backend = "redis"
+            logger.info("[TeachingGraph] checkpointer 后端: AsyncRedisSaver（持久化）")
+        else:
+            _checkpointer = MemorySaver()
+            _checkpointer_backend = "memory"
+            logger.info("[TeachingGraph] checkpointer 后端: MemorySaver（进程内，重启即丢）")
+    return _checkpointer
+
+
+def checkpointer_backend() -> str:
+    """当前 checkpointer 后端标识：'redis'（可跨进程恢复）/ 'memory'。"""
+    return _checkpointer_backend
+
+
+async def get_teaching_graph() -> Any:
+    """幂等单例：共享编译后的教学图（多 thread_id 复用同一实例）。"""
+    global _graph
+    if _graph is not None:
+        return _graph
+    async with _graph_init_lock:
+        if _graph is None:
+            cp = await get_checkpointer()
+            _graph = build_teaching_graph(checkpointer=cp)
+    return _graph
 
 
 # ============================================================
@@ -374,12 +472,18 @@ async def revision_node(state: AgentState, config: RunnableConfig) -> Dict[str, 
 
 async def hitl_gate_node(state: AgentState) -> Dict[str, Any]:
     """
-    人机协作审批节点（compile(interrupt_before) 在进入前暂停）。
-    恢复时 human_decision 由 TeachingGraphRunner.resume 经 update_state 注入。
+    人机协作审批节点（原生 interrupt）。
+    首次执行时 interrupt() 抛出暂停信息；教师经 Command(resume=decision) 恢复后，
+    interrupt() 的返回值即审批决策 {approved, comments}。
     """
-    decision = state.get("human_decision") or {}
-    approved = bool(decision.get("approved", False))
-    comments = decision.get("comments")
+    decision = interrupt({
+        "type": "teaching_approval",
+        "output": state.get("final_markdown_output", ""),
+        "quality_score": state.get("quality_score", 0.0),
+        "artifact": state.get("structured_artifact"),
+    })
+    approved = bool((decision or {}).get("approved", False))
+    comments = (decision or {}).get("comments")
     return {
         "is_approved": approved,
         "reviewer_comments": comments,
@@ -446,18 +550,63 @@ def route_after_hitl(state: AgentState) -> str:
 # Graph 组装
 # ============================================================
 
+def _with_node_metrics(node_name: str, func: Callable):
+    """
+    节点可观测性包装：统一推送 node_start / node_end 事件。
+    node_end 携带 elapsed_ms、retry_count、quality_score，供 SSE 与 trace_summary 使用。
+    兼容 (state, config) 与 (state) 两种节点签名。
+    """
+    takes_config = len(inspect.signature(func).parameters) >= 2
+
+    async def _wrapped(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
+        on_event = _runtime_callbacks(config)["on_event"]
+        session_id = state.get("session_id", "")
+        started = time.monotonic()
+        await _emit(on_event, {
+            "event_type": "node_start",
+            "task_id": session_id,
+            "payload": {"node": node_name},
+        })
+        try:
+            result = await func(state, config) if takes_config else await func(state)
+        except Exception:
+            elapsed = int((time.monotonic() - started) * 1000)
+            await _emit(on_event, {
+                "event_type": "node_end",
+                "task_id": session_id,
+                "payload": {"node": node_name, "elapsed_ms": elapsed, "status": "error"},
+            })
+            raise
+        elapsed = int((time.monotonic() - started) * 1000)
+        await _emit(on_event, {
+            "event_type": "node_end",
+            "task_id": session_id,
+            "payload": {
+                "node": node_name,
+                "elapsed_ms": elapsed,
+                "status": "ok",
+                "retry_count": (result or {}).get("retry_count", 0),
+                "quality_score": (result or {}).get("quality_score"),
+            },
+        })
+        return result
+
+    _wrapped.__name__ = f"{node_name}_instrumented"
+    return _wrapped
+
+
 def build_teaching_graph(checkpointer=None) -> Any:
     """构建 LangGraph 教学智能体图。checkpointer 传 None 则不持久化。"""
     builder = StateGraph(AgentState)
 
-    builder.add_node("intent_router", intent_node)
+    builder.add_node("intent_router", _with_node_metrics("intent_router", intent_node))
     for name in SPECIALIZED_AGENTS:
-        builder.add_node(name, make_agent_node(name))
-    builder.add_node("aggregate", aggregate_node)
-    builder.add_node("quality_review", quality_review_node)
-    builder.add_node("revision", revision_node)
-    builder.add_node("hitl_gate", hitl_gate_node)
-    builder.add_node("approved", auto_approve_node)
+        builder.add_node(name, _with_node_metrics(name, make_agent_node(name)))
+    builder.add_node("aggregate", _with_node_metrics("aggregate", aggregate_node))
+    builder.add_node("quality_review", _with_node_metrics("quality_review", quality_review_node))
+    builder.add_node("revision", _with_node_metrics("revision", revision_node))
+    builder.add_node("hitl_gate", _with_node_metrics("hitl_gate", hitl_gate_node))
+    builder.add_node("approved", _with_node_metrics("approved", auto_approve_node))
 
     builder.set_entry_point("intent_router")
 
@@ -486,11 +635,8 @@ def build_teaching_graph(checkpointer=None) -> Any:
         {"revision": "revision", END: END},
     )
 
-    # HITL：仅在进入 hitl_gate 前暂停（requires_approval=True 且非 auto_approve 时才走到）
-    return builder.compile(
-        checkpointer=checkpointer,
-        interrupt_before=["hitl_gate"],
-    )
+    # HITL 暂停由 hitl_gate 节点内部的 interrupt() 触发（无需 interrupt_before）
+    return builder.compile(checkpointer=checkpointer)
 
 
 # ============================================================
@@ -499,7 +645,7 @@ def build_teaching_graph(checkpointer=None) -> Any:
 
 @dataclass
 class PausedRun:
-    """一次暂停在 hitl_gate 前的图运行（同进程内可恢复）。"""
+    """一次暂停在 hitl_gate（interrupt）处的图运行；checkpoint 已持久化，本地注册便于快速恢复。"""
     graph: Any
     checkpointer: Any
     config: Dict[str, Any]
@@ -517,20 +663,29 @@ class PausedRun:
     snapshot_state: Dict[str, Any] = field(default_factory=dict)
 
 
-def _state_to_result(state: Dict[str, Any], harness: Any, explicit_agent: Optional[str]) -> Dict[str, Any]:
+def _state_to_result(
+    state: Dict[str, Any],
+    harness: Any,
+    explicit_agent: Optional[str],
+    node_timings: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """LangGraph state → 旧 graph_engine.run_workflow 的返回契约"""
     sub_results = state.get("sub_results") or []
     is_parallel = len(sub_results) > 0
     agent_type = "orchestrator" if is_parallel else (
         state.get("current_agent") or explicit_agent or "supervisor"
     )
+    trace_summary = harness.get_trace_summary() if harness is not None else {}
+    if node_timings:
+        # 图执行可观测性：节点耗时 / 重试次数 / quality_score 汇总
+        trace_summary = {**trace_summary, "node_timings": node_timings}
     return {
         "output": state.get("final_markdown_output", ""),
         "agent_type": agent_type,
         "citations": state.get("citations", []),
         "artifact": state.get("structured_artifact"),
         "artifact_type": state.get("artifact_type"),
-        "trace_summary": harness.get_trace_summary() if harness is not None else {},
+        "trace_summary": trace_summary,
         "plan_dag": state.get("plan_dag"),
         "sub_results": sub_results,
         "reflection": {},
@@ -542,9 +697,9 @@ def _state_to_result(state: Dict[str, Any], harness: Any, explicit_agent: Option
 class TeachingGraphRunner:
     """
     LangGraph 运行器（进程内单例）：
-    - run_workflow：与旧 graph_engine 同签名，内部跑真 StateGraph
-    - resume：HITL 暂停后注入教师决策续跑
-    - 暂停态注册在进程内存中（跨进程恢复需 RedisSaver，见 P1）
+    - run_workflow：与旧 graph_engine 同签名，内部跑真 StateGraph（共享图实例）
+    - resume：以 Command(resume=) 注入教师决策续跑
+    - 本地注册暂停元数据；checkpointer 为 RedisSaver 时支持跨进程恢复
     """
 
     def __init__(self):
@@ -552,6 +707,26 @@ class TeachingGraphRunner:
         self._thread_by_task: Dict[str, str] = {}
 
     # ---------- 内部工具 ----------
+
+    @staticmethod
+    def _make_collector(
+        event_callback: Optional[EventCallback],
+        node_timings: List[Dict[str, Any]],
+    ) -> EventCallback:
+        """
+        包装调用方事件回调：旁路收集 node_end 事件（节点耗时/重试/质量分），
+        同时把事件原样转发给调用方（SSE 总线）。
+        """
+        async def _collector(event: Dict[str, Any]):
+            if event.get("event_type") == "node_end":
+                p = event.get("payload") or {}
+                node_timings.append({
+                    k: p.get(k)
+                    for k in ("node", "elapsed_ms", "status", "retry_count", "quality_score")
+                })
+            await _emit(event_callback, event)
+
+        return _collector
 
     def is_waiting(self, task_id: str) -> bool:
         thread_id = self._thread_by_task.get(task_id)
@@ -670,9 +845,9 @@ class TeachingGraphRunner:
         })
         enriched_input = f"{sanitized_input}\n\n{memory_prompt}"
 
-        # ---- 构建图与运行时 config（on_token/on_event 走 config 注入节点）----
-        checkpointer = MemorySaver()
-        graph = build_teaching_graph(checkpointer=checkpointer)
+        # ---- 共享图实例与运行时 config（on_token/on_event 走 config 注入节点）----
+        graph = await get_teaching_graph()
+        checkpointer = await get_checkpointer()
         state = self._build_initial_state(
             user_message=sanitized_input,
             enriched_input=enriched_input,
@@ -684,18 +859,21 @@ class TeachingGraphRunner:
             sub_agent_mode=sub_agent_mode,
             auto_approve=auto_approve,
         )
+
+        node_timings: List[Dict[str, Any]] = []
+        collecting_cb = self._make_collector(event_callback, node_timings)
         config: Dict[str, Any] = {
             "configurable": {
                 "thread_id": thread_id,
                 "on_token": None,  # token 由节点内部经 on_event 通道发送
-                "on_event": event_callback,
+                "on_event": collecting_cb,
             },
             "recursion_limit": 50,
         }
 
         final_state = await graph.ainvoke(state, config=config)
 
-        # ---- HITL 暂停：图停在 hitl_gate 前 ----
+        # ---- HITL 暂停：图停在 hitl_gate 的 interrupt 处 ----
         snapshot = graph.get_state(config)
         if snapshot.next:
             paused = PausedRun(
@@ -719,7 +897,7 @@ class TeachingGraphRunner:
             if task_id:
                 self._thread_by_task[task_id] = thread_id
 
-            result = _state_to_result(final_state, harness, explicit_agent)
+            result = _state_to_result(final_state, harness, explicit_agent, node_timings)
             result["run_status"] = "waiting_approval"
             return result
 
@@ -737,7 +915,7 @@ class TeachingGraphRunner:
             },
         })
 
-        result = _state_to_result(final_state, harness, explicit_agent)
+        result = _state_to_result(final_state, harness, explicit_agent, node_timings)
         result["run_status"] = "completed"
         return result
 
@@ -750,42 +928,100 @@ class TeachingGraphRunner:
         comments: Optional[str] = None,
         event_callback: Optional[EventCallback] = None,
     ) -> Dict[str, Any]:
-        """注入教师审批决策并从 hitl_gate 续跑，返回终态 result（可能再次暂停）。"""
+        """
+        以 Command(resume=decision) 从 hitl_gate 的 interrupt 处续跑，
+        返回终态 result（被驳回返工时可能再次暂停）。
+        - 本地有暂停注册：直接复用其 harness / metadata
+        - 无本地注册（跨进程）：checkpointer 须为 RedisSaver，从任务存储重建上下文
+        """
+        from app.harness.base import AgentHarness
+
         thread_id = self._thread_by_task.get(task_id)
         run = self._paused_by_thread.get(thread_id) if thread_id else None
-        if run is None:
-            raise KeyError(f"未找到任务 {task_id} 的暂停态（跨进程恢复需 RedisSaver）")
 
-        # 更新 config 中的事件回调（恢复请求可能来自新的 HTTP 调用）
-        if event_callback is not None:
-            run.config = {**run.config, "configurable": {
-                **run.config["configurable"], "on_event": event_callback,
-            }}
+        if run is not None:
+            graph = run.graph
+            harness = run.harness
+            explicit_agent = run.explicit_agent
+            conversation_id = run.conversation_id
+            session_id = run.session_id
+        else:
+            # ---- 跨进程恢复：从 Redis 任务存储找回元数据 ----
+            if checkpointer_backend() != "redis":
+                raise KeyError(
+                    f"未找到任务 {task_id} 的本地暂停态，且 checkpointer 非 RedisSaver，无法跨进程恢复"
+                )
+            from app.services.task_queue.redis_task_store import redis_task_store
 
-        run.graph.update_state(
-            run.config,
-            {"human_decision": {"approved": approved, "comments": comments}},
+            task = await redis_task_store.get_task(task_id)
+            if not task:
+                raise KeyError(f"未找到任务 {task_id}")
+            graph = await get_teaching_graph()
+            thread_id = task["thread_id"]
+            session_id = task["session_id"]
+            harness = AgentHarness(session_id=session_id, user_role="teacher")
+            task_agent = task.get("agent_type") or "supervisor"
+            explicit_agent = None if task_agent == "supervisor" else task_agent
+            conversation_id = await redis_task_store.get_conversation_link(task_id)
+            logger.info(f"[TeachingGraph] 跨进程恢复 task={task_id} thread={thread_id}")
+
+        node_timings: List[Dict[str, Any]] = []
+        collecting_cb = self._make_collector(event_callback, node_timings)
+        config: Dict[str, Any] = {
+            "configurable": {
+                "thread_id": thread_id,
+                "on_token": None,
+                "on_event": collecting_cb,
+            },
+            "recursion_limit": 50,
+        }
+
+        final_state = await graph.ainvoke(
+            Command(resume={"approved": approved, "comments": comments}),
+            config=config,
         )
-        final_state = await run.graph.ainvoke(None, config=run.config)
 
         # 被驳回返工后可能再次走到 hitl_gate 暂停（允许教师二次审批）
-        snapshot = run.graph.get_state(run.config)
+        snapshot = graph.get_state(config)
         if snapshot.next:
-            run.snapshot_state = dict(final_state)
-            result = _state_to_result(final_state, run.harness, run.explicit_agent)
+            if run is not None:
+                run.snapshot_state = dict(final_state)
+            else:
+                # 跨进程恢复后再次暂停：在本进程注册，后续审批可快速恢复
+                paused = PausedRun(
+                    graph=graph,
+                    checkpointer=await get_checkpointer(),
+                    config=config,
+                    task_id=task_id,
+                    thread_id=thread_id,
+                    session_id=session_id,
+                    agent_type=explicit_agent or "supervisor",
+                    user_id="u-001",
+                    user_role="teacher",
+                    kb_ids=None,
+                    conversation_id=conversation_id,
+                    harness=harness,
+                    explicit_agent=explicit_agent,
+                    sub_agent_mode=False,
+                    snapshot_state=dict(final_state),
+                )
+                self._paused_by_thread[thread_id] = paused
+                self._thread_by_task[task_id] = thread_id
+
+            result = _state_to_result(final_state, harness, explicit_agent, node_timings)
             result["run_status"] = "waiting_approval"
             return result
 
-        # 终态：清理注册表
+        # 终态：清理本地注册表
         self._paused_by_thread.pop(thread_id, None)
         self._thread_by_task.pop(task_id, None)
 
-        final_state["final_markdown_output"] = run.harness.after_run(
+        final_state["final_markdown_output"] = harness.after_run(
             final_state.get("final_markdown_output", "")
         )
-        result = _state_to_result(final_state, run.harness, run.explicit_agent)
+        result = _state_to_result(final_state, harness, explicit_agent, node_timings)
         result["run_status"] = "completed"
-        result["conversation_id"] = run.conversation_id
+        result["conversation_id"] = conversation_id
         return result
 
     def get_paused_run(self, task_id: str) -> Optional[PausedRun]:
