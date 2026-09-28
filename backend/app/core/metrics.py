@@ -112,6 +112,29 @@ def _build_metrics_text() -> str:
     except Exception:
         pass
 
+    # ---- LLM 供应商路由状态 ----
+    try:
+        from app.services.llm.provider import get_llm_router
+        router = get_llm_router()
+        for route in router.stats():
+            state_val = 1.0 if route["state"] == "CLOSED" else (
+                0.0 if route["state"] == "OPEN" else 0.5
+            )
+            lines.append(_fmt_gauge(
+                "edu_agent_llm_provider_state",
+                "LLM provider circuit breaker state (1=CLOSED, 0.5=HALF_OPEN, 0=OPEN)",
+                state_val,
+                {"provider": route["provider"], "priority": route["priority"]},
+            ))
+            lines.append(_fmt_gauge(
+                "edu_agent_llm_provider_failures",
+                "LLM provider consecutive failure count",
+                route["failure_count"],
+                {"provider": route["provider"]},
+            ))
+    except Exception:
+        pass
+
     # ---- LLM 调用指标（按 agent 维度聚合最近 24h）----
     try:
         from app.services.llm.prompt_metrics import prompt_metrics

@@ -46,9 +46,16 @@ async def lifespan(app: FastAPI):
     # 3. Connect to Redis
     await redis_manager.connect()
 
+    # 4. P4-21: 注册内置 A/B 实验（默认关闭，仅暴露能力）
+    try:
+        from app.services.agent.ab_experiment import auto_register_default_experiments
+        auto_register_default_experiments()
+    except Exception as e:
+        logger.warning("ab_experiments_register_failed", error=str(e))
+
     yield
 
-    # 4. 关闭连接池与遥测
+    # 5. 关闭连接池与遥测
     await redis_manager.disconnect()
     try:
         from app.core.telemetry import shutdown_telemetry
@@ -70,6 +77,7 @@ OPENAPI_TAGS = [
     {"name": "Artifacts", "description": "生成的教案/试卷/课件等制品的查询与导出"},
     {"name": "MCP & Skills", "description": "MCP 工具与 Skill 调用"},
     {"name": "Memory", "description": "长期教学画像与记忆管理"},
+    {"name": "Experimentation", "description": "A/B 实验配置与统计（LangGraph 节点变体分流）"},
 ]
 
 app = FastAPI(
@@ -111,8 +119,10 @@ app.add_middleware(
 # RequestContextMiddleware：注入 request_id/user_id/trace_id
 # 必须晚于 CORS（CORS 需处理预检），但早于路由分发
 from app.middleware.request_context import install_request_context  # noqa: E402
+from app.middleware.tenant_context import install_tenant_context  # noqa: E402
 
 install_request_context(app)
+install_tenant_context(app)
 
 # 业务路由
 app.include_router(api_v1_router, prefix=settings.API_V1_STR)
@@ -199,6 +209,26 @@ async def readyz():
         "ready": dependencies_ok,
         "milvus": "connected" if milvus_manager.is_connected else "fallback_mode",
         "redis": "connected" if redis_manager.is_connected else "fallback_mode",
+    }
+
+
+@app.get("/api/v1/agents/experiments", tags=["Experimentation"], summary="A/B 实验统计")
+async def experiments_stats():
+    """P4-21: 查看所有 A/B 实验的变体执行结果聚合。"""
+    from app.services.agent.ab_experiment import experiment_registry
+    return {
+        "experiments": experiment_registry.stats(),
+        "configs": [
+            {
+                "name": e.name,
+                "enabled": e.enabled,
+                "variants": [
+                    {"name": v.name, "weight": v.weight, "prompt_id": v.prompt_id, "agent": v.agent}
+                    for v in e.variants
+                ],
+            }
+            for e in experiment_registry._experiments.values()
+        ],
     }
 
 

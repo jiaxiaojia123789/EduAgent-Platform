@@ -114,6 +114,22 @@ class BailianLLMClient:
                             await llm_cache.set(messages, model_name, temperature, result)
                         except Exception as e:
                             logger.debug(f"[BailianLLMClient] 缓存写入失败: {e}")
+
+                    # P4-22: 成本告警（best-effort，失败不影响主流程）
+                    try:
+                        from app.services.llm.cost_alert import cost_alert_service
+                        from app.services.tenant.tenant_service import get_current_tenant
+                        usage = result.get("usage", {}) or {}
+                        await cost_alert_service.record_usage(
+                            tenant_id=get_current_tenant(),
+                            user_id=None,  # 由调用方在 config 里注入
+                            model=model_name,
+                            prompt_tokens=usage.get("prompt_tokens", 0),
+                            completion_tokens=usage.get("completion_tokens", 0),
+                        )
+                    except Exception as e:
+                        logger.debug(f"[BailianLLMClient] 成本告警记录失败: {e}")
+
                     return result
                 else:
                     # 真实模式调用失败：抛出明确错误，不再静默 fallback 到 mock
