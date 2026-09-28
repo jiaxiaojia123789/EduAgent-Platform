@@ -125,6 +125,11 @@ services:
         condition: service_healthy
       milvus-standalone:
         condition: service_healthy
+    networks:
+      default: {}
+      edu-agent-network:
+        aliases:
+          - eduagent-backend
 
   # ============================================================================
   # Celery Worker（消费 agent_heavy 队列的长任务）
@@ -176,9 +181,53 @@ services:
     depends_on:
       - backend
 
+  # ============================================================================
+  # Monitoring Stack：Prometheus 抓取 + Grafana 可视化
+  #  注意：grafana 默认映射 3000:3000，与 frontend 主机端口冲突；
+  #        需要同时运行时，请把其中一个改用其他主机端口（如 3001:3000）。
+  # ============================================================================
+  prometheus:
+    container_name: edu-prometheus
+    image: prom/prometheus:v0.49.1
+    restart: always
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - edu-agent-network
+    depends_on:
+      - backend
+
+  grafana:
+    container_name: edu-grafana
+    image: grafana/grafana:10.4.0
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_DEFAULT_THEME=light
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/dashboards/eduagent-overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/etc/grafana/dashboards
+      - grafana_data:/var/lib/grafana
+    networks:
+      - edu-agent-network
+    depends_on:
+      - prometheus
+
 volumes:
   milvus_etcd_data:
   milvus_minio_data:
   milvus_data:
   postgres_data:
   redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  edu-agent-network:
+    driver: bridge

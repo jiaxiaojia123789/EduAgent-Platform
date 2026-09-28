@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "teaching_graph": "./app/services/agent/teaching_graph.py:get_teaching_graph_sync"
+  },
+  "env": ".env"
+}

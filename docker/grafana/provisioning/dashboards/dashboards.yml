@@ -1,0 +1,14 @@
+# Grafana Dashboard 自动加载：从 /etc/grafana/dashboards 读取所有 JSON
+apiVersion: 1
+
+providers:
+  - name: 'eduagent-dashboards'
+    orgId: 1
+    folder: 'EduAgent'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

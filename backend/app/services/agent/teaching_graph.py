@@ -151,6 +151,29 @@ async def get_teaching_graph() -> Any:
     return _graph
 
 
+def get_teaching_graph_sync() -> Any:
+    """
+    LangGraph Studio 同步入口：返回编译后的教学图实例。
+    Studio 期望 sync 函数返回 CompiledStateGraph，本方法通过事件循环桥接 async 单例。
+
+    使用方式（langgraph.json）：
+        "graphs": {"teaching_graph": "./app/services/agent/teaching_graph.py:get_teaching_graph_sync"}
+    """
+    import asyncio
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # 在已有事件循环中：用线程池跑
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(lambda: asyncio.run(get_teaching_graph())).result()
+    except RuntimeError:
+        # 无事件循环：直接 asyncio.run
+        pass
+    return asyncio.run(get_teaching_graph())
+
+
 # ============================================================
 # 节点公共工具
 # ============================================================

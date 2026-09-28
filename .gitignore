@@ -23,6 +23,9 @@ htmlcov/
 coverage.xml
 .coverage
 
+# MkDocs 构建产物
+site/
+
 # Node / Next.js
 node_modules/
 .next/

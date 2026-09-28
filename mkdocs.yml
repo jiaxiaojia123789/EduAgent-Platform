@@ -1,0 +1,121 @@
+site_name: EduAgent-Platform
+site_description: 企业级教学多智能体平台 — LangGraph 1.x / 9 专业 agent / HITL 审批 / 多租户 / 成本告警
+site_url: https://jiaxiaojia123789.github.io/EduAgent-Platform
+repo_url: https://github.com/jiaxiaojia123789/EduAgent-Platform
+repo_name: EduAgent-Platform
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  language: zh
+  font:
+    text: Noto Sans SC
+    code: JetBrains Mono
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/brightness-7
+        name: 切换暗色模式
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/brightness-4
+        name: 切换亮色模式
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+  icon:
+    repo: fontawesome/brands/github
+  favicon: assets/favicon.png
+
+plugins:
+  - search:
+      lang:
+        - en
+        - zh
+  - mermaid2:
+      arguments:
+        theme: |
+          ^(light|dark)$
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:mermaid2.fence_mermaid
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - attr_list
+  - md_in_html
+  - def_list
+  - footnotes
+  - toc:
+      permalink: true
+
+nav:
+  - 首页: index.md
+  - 快速开始:
+      - 安装与启动: getting-started/installation.md
+      - 配置说明: getting-started/configuration.md
+      - 首次运行: getting-started/first-run.md
+  - 系统架构:
+      - 总览: architecture/overview.md
+      - LangGraph 工作流: architecture/langgraph-flow.md
+      - 多租户隔离: architecture/multi-tenant.md
+      - 韧性设计: architecture/resilience.md
+  - 核心能力:
+      - 流式生成: features/streaming.md
+      - HITL 审批: features/hitl-approval.md
+      - RAG 混合检索: features/rag-hybrid.md
+      - A/B 实验: features/ab-experiments.md
+      - 成本告警: features/cost-alerts.md
+  - API 参考:
+      - 总览: api/overview.md
+      - 认证: api/authentication.md
+      - 智能体: api/agents.md
+      - 异步任务: api/tasks.md
+      - 运维: api/admin.md
+  - 运维:
+      - CI/CD 流水线: operations/ci-cd.md
+      - 可观测性: operations/observability.md
+      - 部署: operations/deployment.md
+      - 故障排查: operations/troubleshooting.md
+  - 面试准备:
+      - 技术选型理由: interview/design-decisions.md
+      - 性能数据: interview/performance-data.md
+      - 常见追问: interview/faq.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/jiaxiaojia123789/EduAgent-Platform
+  generator: false
+
+copyright: Copyright &copy; 2026 EduAgent-Platform

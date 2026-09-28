@@ -1,0 +1,5 @@
+# 文档构建依赖（CI/本地预览用，与生产依赖隔离）
+mkdocs-material==9.5.49
+mkdocs-mermaid2-plugin==1.1.1
+mkdocs-git-revision-date-localized-plugin==1.2.6
+mkdocs-minify-plugin==0.8.0
