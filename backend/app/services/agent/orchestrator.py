@@ -781,7 +781,7 @@ class OrchestratorAgent:
         if not parts:
             # 全部失败时返回错误信息
             errors = [f"- {r.task_id}: {r.error_message}" for r in results if r.error_message]
-            return f"所有 sub-agent 执行失败：\n" + "\n".join(errors)
+            return "所有 sub-agent 执行失败：\n" + "\n".join(errors)
 
         return "\n\n---\n\n".join(parts)
 

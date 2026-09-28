@@ -42,12 +42,24 @@ class BailianLLMClient:
         max_tokens: int = 4096,
         response_format: Optional[Dict[str, Any]] = None,
         enable_thinking: bool = False,
+        no_cache: bool = False,
     ) -> Dict[str, Any]:
         """
         Async non-streaming completion.
         enable_thinking: True 时返回 reasoning_content（思维链），qwen3 系列支持
+        no_cache: True 跳过响应缓存（如教师审批后强制重新生成）
         """
         model_name = model or settings.DEFAULT_LLM_MODEL
+
+        # P3-16: 响应缓存（精确 + 语义）。流式调用不走缓存（流式本身就是渐进式消费）
+        if not no_cache and temperature <= 0.5:
+            try:
+                from app.services.llm.response_cache import llm_cache
+                cached = await llm_cache.get(messages, model_name, temperature)
+                if cached is not None:
+                    return cached
+            except Exception as e:
+                logger.debug(f"[BailianLLMClient] 缓存查询失败: {e}")
 
         if not self.is_mock:
             try:
@@ -89,12 +101,20 @@ class BailianLLMClient:
                     content = message.get("content") or ""
                     # 思维链字段（qwen3 系列）：默认丢弃，仅 enable_thinking=True 时返回
                     reasoning = message.get("reasoning_content", "") if enable_thinking else ""
-                    return {
+                    result = {
                         "content": content,
                         "reasoning": reasoning,
                         "model": model_name,
                         "usage": data.get("usage", {}),
                     }
+                    # P3-16: 写入响应缓存（best-effort，失败不影响主流程）
+                    if not no_cache and temperature <= 0.5:
+                        try:
+                            from app.services.llm.response_cache import llm_cache
+                            await llm_cache.set(messages, model_name, temperature, result)
+                        except Exception as e:
+                            logger.debug(f"[BailianLLMClient] 缓存写入失败: {e}")
+                    return result
                 else:
                     # 真实模式调用失败：抛出明确错误，不再静默 fallback 到 mock
                     error_body = resp.text[:500]

@@ -47,3 +47,15 @@ aiofiles==24.1.0
 pytest==8.3.3
 pytest-asyncio==0.24.0
 pytest-mock==3.14.0
+pytest-cov==5.0.0            # 用于：CI 覆盖率上报（xml/term/html）
+ruff==0.6.9                  # 用于：CI lint（替代 flake8+isort+black）
+
+# Structured Logging & Distributed Tracing（P2 可观测性基础设施）
+structlog==24.4.0           # 用于：JSON 结构化日志 + request_id/trace_id 贯穿
+opentelemetry-api==1.27.0   # 用于：分布式追踪统一 API
+opentelemetry-sdk==1.27.0   # 用于：TracerProvider/SpanExporter 实现
+opentelemetry-instrumentation-fastapi==0.48b0  # 自动埋点 FastAPI
+opentelemetry-instrumentation-httpx==0.48b0    # 自动埋点 LLM/外部 HTTP 调用
+opentelemetry-instrumentation-sqlalchemy==0.48b0  # 自动埋点 DB 查询
+opentelemetry-instrumentation-redis==0.48b0    # 自动埋点 Redis 操作
+opentelemetry-exporter-otlp==1.27.0           # OTLP HTTP/gRPC 导出（Jaeger/Tempo）

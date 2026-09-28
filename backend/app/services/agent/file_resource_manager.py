@@ -19,7 +19,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.redis_client import redis_manager
 

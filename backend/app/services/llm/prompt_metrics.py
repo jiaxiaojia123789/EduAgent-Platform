@@ -68,14 +68,32 @@ class PromptMetricsService:
                         api_json_mode  INTEGER NOT NULL,
                         latency_ms     REAL,
                         session_id     TEXT,
-                        user_id        TEXT,
-                        error          TEXT
+                        user_id       TEXT,
+                        error         TEXT
                     )
                 """)
                 conn.execute("""
                     CREATE INDEX IF NOT EXISTS idx_metrics_prompt_ts
                     ON prompt_call_metrics(prompt_id, ts)
                 """)
+                # P3-15: 增加 token usage 列（幂等迁移：检测列缺失则补加）
+                self._ensure_columns(conn, [
+                    ("prompt_tokens",  "INTEGER NOT NULL DEFAULT 0"),
+                    ("completion_tokens","INTEGER NOT NULL DEFAULT 0"),
+                    ("total_tokens",    "INTEGER NOT NULL DEFAULT 0"),
+                    ("cached",          "INTEGER NOT NULL DEFAULT 0"),
+                ])
+                conn.commit()
+
+    @staticmethod
+    def _ensure_columns(conn: sqlite3.Connection, columns: list) -> None:
+        """幂等加列：检测列不存在则 ALTER TABLE 补加。"""
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(prompt_call_metrics)")}
+        for col_name, col_def in columns:
+            if col_name not in existing:
+                conn.execute(
+                    f"ALTER TABLE prompt_call_metrics ADD COLUMN {col_name} {col_def}"
+                )
 
     # ------------------------------------------------------------------
     def sync_registry_snapshot(self) -> None:
@@ -114,8 +132,12 @@ class PromptMetricsService:
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
         error: Optional[str] = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        cached: bool = False,
     ) -> None:
-        """记录一次结构化输出调用（best-effort，失败不影响主流程）"""
+        """记录一次结构化输出调用（best-effort，失败不影响主流程）。"""
         try:
             version: Optional[str] = None
             try:
@@ -129,14 +151,16 @@ class PromptMetricsService:
                         INSERT INTO prompt_call_metrics (
                             ts, prompt_id, version, schema_name, agent, model,
                             parse_ok, attempts, retried, api_json_mode,
-                            latency_ms, session_id, user_id, error
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            latency_ms, session_id, user_id, error,
+                            prompt_tokens, completion_tokens, total_tokens, cached
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         datetime.now(timezone.utc).isoformat(),
                         prompt_id, version, schema_name, agent, model,
                         int(parse_ok), int(attempts), int(retried), int(api_json_mode),
                         round(latency_ms, 1), session_id, user_id,
                         (error or "")[:500] or None,
+                        int(prompt_tokens), int(completion_tokens), int(total_tokens), int(cached),
                     ))
         except Exception as e:
             logger.warning(f"[PromptMetrics] 指标写入失败: {e}")
@@ -155,6 +179,11 @@ class PromptMetricsService:
                        AVG(parse_ok)                  AS parse_success_rate,
                        AVG(attempts)                  AS avg_attempts,
                        SUM(retried)                   AS retry_count,
+                       AVG(latency_ms)                AS avg_latency_ms,
+                       SUM(prompt_tokens)             AS total_prompt_tokens,
+                       SUM(completion_tokens)         AS total_completion_tokens,
+                       SUM(total_tokens)              AS total_tokens,
+                       SUM(cached)                    AS cached_calls,
                        AVG(latency_ms)                AS avg_latency_ms
                 FROM prompt_call_metrics {where}
                 GROUP BY prompt_id
@@ -162,7 +191,8 @@ class PromptMetricsService:
             """, params).fetchall()
             recent = conn.execute(f"""
                 SELECT ts, prompt_id, schema_name, agent, model, parse_ok,
-                       attempts, api_json_mode, latency_ms, error
+                       attempts, api_json_mode, latency_ms, error,
+                       prompt_tokens, completion_tokens, total_tokens, cached
                 FROM prompt_call_metrics {where}
                 ORDER BY id DESC LIMIT ?
             """, (*params, limit)).fetchall()
@@ -178,6 +208,78 @@ class PromptMetricsService:
             "summary": [_row(r) for r in rows],
             "recent": [dict(r) for r in recent],
         }
+
+    # ------------------------------------------------------------------
+    def agent_stats(self, since_hours: int = 24) -> List[Dict[str, Any]]:
+        """
+        P3-15: 按 agent 维度聚合最近 N 小时的指标：
+        - 调用数、缓存命中率、错误率
+        - p50/p95 延迟（用 NTILE 简化实现）
+        - token 总成本
+        供 /metrics Prometheus 端点 + 看板使用。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    COALESCE(agent, 'unknown')              AS agent,
+                    COUNT(*)                                 AS total_calls,
+                    SUM(cached)                              AS cached_calls,
+                    SUM(CASE WHEN parse_ok = 0 THEN 1 ELSE 0 END) AS failed_calls,
+                    AVG(latency_ms)                         AS avg_latency_ms,
+                    SUM(total_tokens)                       AS total_tokens,
+                    SUM(prompt_tokens)                      AS prompt_tokens,
+                    SUM(completion_tokens)                  AS completion_tokens
+                FROM prompt_call_metrics
+                WHERE ts >= datetime('now', ?)
+                GROUP BY agent
+                ORDER BY total_calls DESC
+                """,
+                (f"-{since_hours} hours",),
+            ).fetchall()
+
+            # p50/p95 用窗口函数（SQLite 3.25+ 支持）
+            p_rows = conn.execute(
+                """
+                WITH ranked AS (
+                    SELECT agent, latency_ms,
+                           ROW_NUMBER() OVER (PARTITION BY agent ORDER BY latency_ms) AS rn,
+                           COUNT(*)   OVER (PARTITION BY agent)                       AS cnt
+                    FROM prompt_call_metrics
+                    WHERE ts >= datetime('now', ?) AND latency_ms IS NOT NULL
+                )
+                SELECT agent,
+                       AVG(CASE WHEN rn <= cnt * 0.5  THEN latency_ms END) AS p50,
+                       AVG(CASE WHEN rn <= cnt * 0.95 THEN latency_ms END) AS p95
+                FROM ranked
+                GROUP BY agent
+                """,
+                (f"-{since_hours} hours",),
+            ).fetchall()
+
+        p_map = {r["agent"]: (r["p50"], r["p95"]) for r in p_rows}
+        result: List[Dict[str, Any]] = []
+        for r in rows:
+            agent = r["agent"]
+            p50, p95 = p_map.get(agent, (None, None))
+            total = r["total_calls"] or 0
+            cached = r["cached_calls"] or 0
+            failed = r["failed_calls"] or 0
+            result.append({
+                "agent": agent,
+                "total_calls": total,
+                "cached_calls": cached,
+                "cache_hit_rate": round(cached / total, 4) if total else 0.0,
+                "failed_calls": failed,
+                "error_rate": round(failed / total, 4) if total else 0.0,
+                "avg_latency_ms": round(r["avg_latency_ms"], 1) if r["avg_latency_ms"] else 0.0,
+                "p50_latency_ms": round(p50, 1) if p50 else None,
+                "p95_latency_ms": round(p95, 1) if p95 else None,
+                "total_tokens": r["total_tokens"] or 0,
+                "prompt_tokens": r["prompt_tokens"] or 0,
+                "completion_tokens": r["completion_tokens"] or 0,
+            })
+        return result
 
 
 prompt_metrics = PromptMetricsService()

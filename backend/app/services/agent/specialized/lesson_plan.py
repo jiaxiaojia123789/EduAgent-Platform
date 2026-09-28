@@ -64,7 +64,7 @@ class LessonPlanMasterAgent(SubAgent):
         board_md = (
             f"**布局**：{board.layout_type}\n\n"
             f"**正板书**\n" + "\n".join(f"- {x}" for x in board.main_board) + "\n\n"
-            f"**副板书**\n" + "\n".join(f"- {x}" for x in board.auxiliary_board)
+            "**副板书**\n" + "\n".join(f"- {x}" for x in board.auxiliary_board)
         )
         homework = "\n".join(f"- {a}" for a in plan.assignment)
 

@@ -552,16 +552,41 @@ def route_after_hitl(state: AgentState) -> str:
 
 def _with_node_metrics(node_name: str, func: Callable):
     """
-    节点可观测性包装：统一推送 node_start / node_end 事件。
-    node_end 携带 elapsed_ms、retry_count、quality_score，供 SSE 与 trace_summary 使用。
+    节点可观测性包装：
+    1. OpenTelemetry span（与 HTTP 请求 trace 串联）
+    2. SSE 事件 node_start / node_end
+    3. node_end 携带 elapsed_ms / retry_count / quality_score，写入 trace_summary
     兼容 (state, config) 与 (state) 两种节点签名。
     """
     takes_config = len(inspect.signature(func).parameters) >= 2
+
+    # 延迟导入避免未装 opentelemetry 时整模块加载失败
+    try:
+        from app.core.telemetry import get_tracer
+        _tracer = get_tracer("teaching_graph")
+    except Exception:
+        _tracer = None
 
     async def _wrapped(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
         on_event = _runtime_callbacks(config)["on_event"]
         session_id = state.get("session_id", "")
         started = time.monotonic()
+
+        # OTel span：节点级追踪，与 HTTP span、httpx span、DB span 自动串联
+        span_ctx = None
+        if _tracer is not None:
+            try:
+                span_ctx = _tracer.start_as_current_span(
+                    f"langgraph.node.{node_name}",
+                    attributes={
+                        "langgraph.node": node_name,
+                        "session.id": session_id,
+                    },
+                )
+                span_ctx.__enter__()
+            except Exception:
+                span_ctx = None
+
         await _emit(on_event, {
             "event_type": "node_start",
             "task_id": session_id,
@@ -569,7 +594,12 @@ def _with_node_metrics(node_name: str, func: Callable):
         })
         try:
             result = await func(state, config) if takes_config else await func(state)
-        except Exception:
+        except Exception as exc:
+            if span_ctx is not None:
+                try:
+                    span_ctx.__exit__(type(exc), exc, exc.__traceback__)
+                except Exception:
+                    pass
             elapsed = int((time.monotonic() - started) * 1000)
             await _emit(on_event, {
                 "event_type": "node_end",
@@ -589,6 +619,11 @@ def _with_node_metrics(node_name: str, func: Callable):
                 "quality_score": (result or {}).get("quality_score"),
             },
         })
+        if span_ctx is not None:
+            try:
+                span_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
         return result
 
     _wrapped.__name__ = f"{node_name}_instrumented"

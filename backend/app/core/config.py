@@ -1,7 +1,7 @@
 import os
 from typing import List, Optional
-from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
 
 
 class Settings(BaseSettings):
@@ -10,12 +10,19 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     DEBUG: bool = True
     API_V1_STR: str = "/api/v1"
-    
+
     # Security & Auth
     SECRET_KEY: str = "super-secret-key-please-change-in-production-min-32-chars"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
     ALGORITHM: str = "HS256"
     BACKEND_CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://127.0.0.1:3000", "*"]
+
+    # OpenTelemetry 分布式追踪（P2-11）
+    # 未设置 OTLP 端点时，trace 仅打印到 stdout（不影响主链路）
+    OTEL_SERVICE_NAME: str = "edu-agent-backend"
+    OTEL_EXPORTER_OTLP_ENDPOINT: Optional[str] = None  # 例: http://localhost:4317
+    OTEL_TRACES_EXPORTER: str = "otlp"  # otlp / console / none
+    OTEL_RESOURCE_ATTRIBUTES: str = "deployment.environment=development"
 
     # Alibaba Bailian (DashScope)
     # 真实密钥必须从 .env 读取，不要硬编码到代码里（安全最佳实践）
@@ -92,10 +99,28 @@ class Settings(BaseSettings):
     CONTEXT_KEEP_RECENT: int = 3        # 最近 N 轮原文不压缩
     CONTEXT_ARCHIVE_TTL: int = 604800   # 归档原文保留 7 天（对齐 checkpointer）
 
-    class Config:
-        case_sensitive = True
-        env_file = ".env"
-        extra = "allow"
+    model_config = SettingsConfigDict(
+        case_sensitive=True,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="allow",
+    )
+
+    @field_validator("SECRET_KEY")
+    @classmethod
+    def _validate_secret_key(cls, v: str) -> str:
+        """
+        生产环境硬约束：SECRET_KEY 不能是默认值且长度 >=32。
+        CI/开发环境跳过校验，便于 MockLLM/无密钥场景跑通。
+        """
+        _default = "super-secret-key-please-change-in-production-min-32-chars"
+        env = os.environ.get("ENVIRONMENT", "development")
+        if env.lower() in {"production", "prod"}:
+            if v == _default or len(v) < 32:
+                raise ValueError(
+                    "SECRET_KEY 在生产环境必须设置 ≥32 字符的非默认值（请在 .env 中配置）"
+                )
+        return v
 
 
 settings = Settings()

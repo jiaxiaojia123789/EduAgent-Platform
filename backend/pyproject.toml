@@ -1,0 +1,57 @@
+# ============================================================
+# 项目级工具配置（ruff + pytest）
+# ============================================================
+# ruff：超快 lint + format，兼容 black 风格
+# pytest：asyncio 自动模式 + 覆盖率上报
+# CI 与本地共用同一份配置，避免行为漂移
+# ============================================================
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = [
+    "alembic/versions",  # 自动生成的迁移脚本不参与 lint
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+# 宽松规则集：与项目 memory 中记录的 CI 策略一致
+# 当前阶段只启用 E/F/W（pyflakes + pycodestyle），真正能拦 bug 的规则
+# I/B/SIM/UP 等风格类规则后续渐进迁移，避免 CI 一上线就 184 个错误卡住流水线
+# 忽略：
+#   E501 行长 / E402 顶层 import 顺序 / F401 未使用 import / F841 未使用变量
+#   W293 空白行含空格（纯风格，多数项目不强制）
+ignore = ["E501", "E402", "F401", "F841", "W293"]
+select = ["E", "F", "W"]
+# 不使用 isort（与既有约定一致）
+fixable = ["ALL"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+# pytest 配置在 backend/pytest.ini，避免与 pyproject.toml 冲突
+# 覆盖率配置仍在此处（[tool.coverage.*]）
+
+[tool.coverage.run]
+source = ["app"]
+omit = [
+    "app/__init__.py",
+    "*/tests/*",
+    "*/alembic/*",
+]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+show_missing = true
+skip_covered = false

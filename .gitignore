@@ -18,6 +18,11 @@ __pycache__/
 venv/
 env/
 
+# Coverage / lint artifacts（P2 CI 产物）
+htmlcov/
+coverage.xml
+.coverage
+
 # Node / Next.js
 node_modules/
 .next/
@@ -26,6 +31,7 @@ dist/
 npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*
+**/*.tsbuildinfo
 
 # Database
 *.db
